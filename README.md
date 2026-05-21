@@ -151,7 +151,7 @@ This structured input gives the model richer signal than raw code alone.
   </picture>
 </p>
 
-ColGREP on a single H100 GPU at FP32 against [Semble](https://github.com/MinishLab/semble)'s public bench — 1,251 NL queries × 63 repos × 19 languages.
+ColGREP against Semble public bench: 1,251 queries × 63 repos × 19 languages (FP32).
 
 ---
 
