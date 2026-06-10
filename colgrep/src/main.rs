@@ -131,6 +131,7 @@ fn main() -> Result<()> {
             pool_factor,
             auto_confirm,
             static_batch,
+            no_update,
         }) => {
             // If only -e pattern is given without a query, use the pattern as the query too
             let original_query = query.clone();
@@ -223,6 +224,7 @@ fn main() -> Result<()> {
                     resolve_pool_factor(pool_factor, no_pool),
                     auto_confirm,
                     static_batch,
+                    no_update,
                 )
             } else {
                 // No query or text_pattern provided - show help
@@ -396,6 +398,7 @@ fn main() -> Result<()> {
                     resolve_pool_factor(cli.pool_factor, cli.no_pool),
                     cli.auto_confirm,
                     false,
+                    cli.no_update,
                 )
             } else {
                 // No query provided - show help

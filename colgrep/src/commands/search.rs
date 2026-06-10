@@ -557,6 +557,7 @@ pub fn cmd_search(
     pool_factor: Option<usize>,
     auto_confirm: bool,
     static_batch: bool,
+    no_update: bool,
 ) -> Result<()> {
     // Resolve context_lines: CLI > config > default (20)
     let context_lines = resolve_context_lines(cli_context_lines, 20);
@@ -601,6 +602,7 @@ pub fn cmd_search(
             pool_factor,
             auto_confirm,
             static_batch,
+            no_update,
         ) {
             Ok(results) => all_results.extend(results),
             Err(e) => {
@@ -1052,6 +1054,7 @@ fn search_single_path(
     pool_factor: Option<usize>,
     auto_confirm: bool,
     static_batch: bool,
+    no_update: bool,
 ) -> Result<Vec<colgrep::SearchResult>> {
     let path = match std::fs::canonicalize(path) {
         Ok(p) => p,
@@ -1143,8 +1146,10 @@ fn search_single_path(
 
     // Auto-index: try incremental update without blocking on the lock.
     // If another process is indexing, skip the update and search the existing index.
+    // --no-update skips this entirely: agents in hot search loops can opt out of
+    // paying the change-detection scan and any re-encoding before results return.
     let mut index_locked = false;
-    {
+    if !no_update {
         let mut builder = IndexBuilder::with_options(
             &effective_root,
             &model,
@@ -1231,6 +1236,12 @@ fn search_single_path(
     let index_dir = get_index_dir_for_project(&effective_root, &model)?;
     let vector_index_path = get_vector_index_path(&index_dir);
     if !vector_index_path.join("metadata.json").exists() {
+        if no_update {
+            anyhow::bail!(
+                "No index found and --no-update was passed. Run once without --no-update \
+                 (or `colgrep init`) to build the index first."
+            );
+        }
         if index_locked {
             // Index is being created for the first time by another process — nothing to search yet
             anyhow::bail!("colgrep index is currently being built, rely on grep for now.");
@@ -1306,6 +1317,12 @@ fn search_single_path(
             } =>
         {
             // Index is corrupted or empty (no concurrent updater) - clear and rebuild
+            if no_update {
+                return Err(e).with_context(|| {
+                    "Index appears corrupted and --no-update prevents rebuilding it. \
+                     Rerun without --no-update to repair the index."
+                });
+            }
             if !json && !files_only {
                 eprintln!("⚠️  Index corrupted, rebuilding...");
             }
