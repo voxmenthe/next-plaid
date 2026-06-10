@@ -118,6 +118,57 @@ pub fn build_embedding_text(unit: &CodeUnit) -> String {
         return truncate_text(&unit.code, MAX_EMBEDDING_TEXT_CHARS);
     }
 
+    let mut parts = metadata_parts(unit);
+
+    // === File Path (shortened for better LLM encoding) ===
+    // Placed before Code intentionally: when the text is truncated at
+    // MAX_EMBEDDING_TEXT_CHARS, the file path is preserved while only
+    // the tail of the source code is lost.
+    let file_part = format!(
+        "File: {}",
+        normalize_path_for_embedding(&shorten_path(&unit.file))
+    );
+    parts.push(file_part);
+
+    // === Full Source Code ===
+    if !unit.code.is_empty() {
+        parts.push(format!("Code:\n{}", unit.code));
+    }
+
+    truncate_text(&parts.join("\n"), MAX_EMBEDDING_TEXT_CHARS)
+}
+
+/// Fingerprint of everything embedding-relevant about a unit, for incremental
+/// re-embedding decisions: equal fingerprints mean re-encoding the unit would
+/// produce an equivalent vector and identical content metadata.
+///
+/// Deliberate differences from the exact embedding input:
+/// - The file path is excluded, so renames keep fingerprints valid and the
+///   caller decides the rename policy.
+/// - Nothing is truncated: two units whose texts differ only past the
+///   embedding cap still get distinct fingerprints, so the stored metadata
+///   (full code, FTS text) is refreshed even when the vector wouldn't change.
+///
+/// Line numbers are not part of the unit's content: a unit that merely shifts
+/// keeps its fingerprint, and the caller refreshes its metadata in place.
+pub fn unit_fingerprint(unit: &CodeUnit) -> u64 {
+    use xxhash_rust::xxh3::xxh3_64;
+
+    if unit.unit_type == UnitType::RawCode || unit.unit_type == UnitType::Constant {
+        return xxh3_64(unit.code.as_bytes());
+    }
+
+    let mut parts = metadata_parts(unit);
+    if !unit.code.is_empty() {
+        parts.push(format!("Code:\n{}", unit.code));
+    }
+    xxh3_64(parts.join("\n").as_bytes())
+}
+
+/// The path-independent metadata lines of the embedding text (everything except
+/// the `File:` line and the source code). Shared between [`build_embedding_text`]
+/// and [`unit_fingerprint`] so the fingerprint tracks exactly what gets embedded.
+fn metadata_parts(unit: &CodeUnit) -> Vec<String> {
     let mut parts = Vec::new();
 
     // === Layer 1: AST (Identity + Signature) ===
@@ -171,12 +222,13 @@ pub fn build_embedding_text(unit: &CodeUnit) -> String {
     }
 
     // === Layer 2: Call Graph ===
+    // Only outgoing calls: they derive from the unit's own body, so the text is a
+    // pure function of file content. `called_by` is intentionally excluded — it is
+    // computed per indexing batch (incremental runs only see changed files' units),
+    // so the same unchanged function would embed differently depending on which
+    // files happened to change alongside it. It remains in the metadata DB.
     if !unit.calls.is_empty() {
         parts.push(format!("Calls: {}", unit.calls.join(", ")));
-    }
-
-    if !unit.called_by.is_empty() {
-        parts.push(format!("Called by: {}", unit.called_by.join(", ")));
     }
 
     // === Layer 4: Data Flow ===
@@ -189,22 +241,7 @@ pub fn build_embedding_text(unit: &CodeUnit) -> String {
         parts.push(format!("Uses: {}", unit.imports.join(", ")));
     }
 
-    // === File Path (shortened for better LLM encoding) ===
-    // Placed before Code intentionally: when the text is truncated at
-    // MAX_EMBEDDING_TEXT_CHARS, the file path is preserved while only
-    // the tail of the source code is lost.
-    let file_part = format!(
-        "File: {}",
-        normalize_path_for_embedding(&shorten_path(&unit.file))
-    );
-    parts.push(file_part);
-
-    // === Full Source Code ===
-    if !unit.code.is_empty() {
-        parts.push(format!("Code:\n{}", unit.code));
-    }
-
-    truncate_text(&parts.join("\n"), MAX_EMBEDDING_TEXT_CHARS)
+    parts
 }
 
 #[cfg(test)]
@@ -334,6 +371,129 @@ mod tests {
         let file_idx = text.find("File: ").unwrap();
         let code_idx = text.find("Code:\n").unwrap();
         assert!(file_idx < code_idx);
+    }
+
+    /// The embedding text must be a pure function of the unit's own file content.
+    /// `called_by` is populated by build_call_graph over whatever batch of units
+    /// happens to be indexed together, so baking it into the text made the same
+    /// function embed differently across incremental runs.
+    #[test]
+    fn test_embedding_text_ignores_batch_local_called_by() {
+        let mut unit = CodeUnit::new(
+            "compute".to_string(),
+            "src/math.rs".into(),
+            1,
+            5,
+            crate::parser::Language::Rust,
+            UnitType::Function,
+            None,
+        );
+        unit.signature = "fn compute() -> i32".to_string();
+        unit.code = "fn compute() -> i32 { helper() }".to_string();
+        unit.calls = vec!["helper".to_string()];
+
+        let without_callers = build_embedding_text(&unit);
+        unit.called_by = vec!["caller_a".to_string(), "caller_b".to_string()];
+        let with_callers = build_embedding_text(&unit);
+
+        assert_eq!(without_callers, with_callers);
+        assert!(!with_callers.contains("Called by"));
+        assert!(with_callers.contains("Calls: helper"));
+    }
+
+    fn fingerprint_unit(file: &str, name: &str, code: &str) -> CodeUnit {
+        let mut unit = CodeUnit::new(
+            name.to_string(),
+            file.into(),
+            10,
+            20,
+            crate::parser::Language::Rust,
+            UnitType::Function,
+            None,
+        );
+        unit.signature = format!("fn {name}()");
+        unit.code = code.to_string();
+        unit
+    }
+
+    /// Fingerprints must survive everything that doesn't change the unit's own
+    /// content: file renames (path excluded by design), line shifts, and
+    /// batch-local called_by. They must change when the code changes.
+    #[test]
+    fn test_unit_fingerprint_stability() {
+        let unit = fingerprint_unit("src/a.rs", "compute", "fn compute() { work() }");
+        let base = unit_fingerprint(&unit);
+
+        let mut renamed_file = unit.clone();
+        renamed_file.file = "src/moved/elsewhere.rs".into();
+        renamed_file.qualified_name = "src/moved/elsewhere.rs::compute".to_string();
+        assert_eq!(
+            base,
+            unit_fingerprint(&renamed_file),
+            "path must not matter"
+        );
+
+        let mut shifted = unit.clone();
+        shifted.line = 100;
+        shifted.end_line = 110;
+        assert_eq!(
+            base,
+            unit_fingerprint(&shifted),
+            "line numbers must not matter"
+        );
+
+        let mut with_callers = unit.clone();
+        with_callers.called_by = vec!["main".to_string()];
+        assert_eq!(
+            base,
+            unit_fingerprint(&with_callers),
+            "called_by must not matter"
+        );
+
+        let mut edited = unit.clone();
+        edited.code = "fn compute() { work(); more() }".to_string();
+        assert_ne!(
+            base,
+            unit_fingerprint(&edited),
+            "code changes must change it"
+        );
+
+        let mut redoc = unit.clone();
+        redoc.docstring = Some("Computes things.".to_string());
+        assert_ne!(
+            base,
+            unit_fingerprint(&redoc),
+            "docstring changes must change it"
+        );
+    }
+
+    /// Unlike the embedding text, the fingerprint must see past the truncation
+    /// cap: a change in the tail of a huge unit doesn't move the vector, but the
+    /// stored metadata (full code, FTS text) still needs refreshing.
+    #[test]
+    fn test_unit_fingerprint_sees_past_truncation_cap() {
+        let long_code = "x".repeat(MAX_EMBEDDING_TEXT_CHARS + 100);
+        let a = fingerprint_unit("src/a.rs", "huge", &long_code);
+        let mut b = a.clone();
+        b.code = format!("{}y", &long_code[..long_code.len() - 1]);
+
+        assert_eq!(build_embedding_text(&a), build_embedding_text(&b));
+        assert_ne!(unit_fingerprint(&a), unit_fingerprint(&b));
+    }
+
+    /// RawCode units embed as bare code (no name/signature lines), so their
+    /// fingerprint is content-only: the same block keeps its fingerprint when a
+    /// shift renames it (raw_code_<line>), letting the caller treat it as moved.
+    #[test]
+    fn test_unit_fingerprint_raw_code_is_content_only() {
+        let mut a = fingerprint_unit("src/a.rs", "raw_code_5", "let x = 1;");
+        a.unit_type = UnitType::RawCode;
+        let mut b = fingerprint_unit("src/a.rs", "raw_code_42", "let x = 1;");
+        b.unit_type = UnitType::RawCode;
+        b.line = 42;
+        b.end_line = 42;
+
+        assert_eq!(unit_fingerprint(&a), unit_fingerprint(&b));
     }
 
     #[test]

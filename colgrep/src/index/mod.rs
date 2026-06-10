@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "cuda")]
 use crate::acceleration::apply_acceleration_mode;
 use crate::acceleration::{env_acceleration_mode_lossy, AccelerationMode};
-use crate::embed::build_embedding_text;
+use crate::embed::{build_embedding_text, unit_fingerprint};
 use crate::parser::{build_call_graph, detect_language, extract_units, CodeUnit, Language};
 use crate::signal::{is_interrupted, is_interrupted_outside_critical, CriticalSectionGuard};
 
@@ -32,7 +32,7 @@ use paths::{
     acquire_index_lock, get_index_dir_for_project, get_vector_index_path, try_acquire_index_lock,
     ProjectMetadata,
 };
-use state::{get_mtime, hash_file, FileInfo, IndexState, INDEX_FORMAT_VERSION};
+use state::{get_mtime, hash_file, FileInfo, IndexState, UnitFingerprint, INDEX_FORMAT_VERSION};
 
 /// Maximum file size to index (512 KB)
 /// Files larger than this are skipped to avoid:
@@ -56,20 +56,26 @@ const BUILDING_MARKER: &str = ".building";
 /// more often (more resumable) at the cost of more index-append overhead.
 const BUILD_CHECKPOINT_UNITS: usize = 4096;
 
-/// Test-only counter of expensive `delete_from_index` invocations.
+/// Test-only per-index counter of expensive `delete_from_index` invocations.
 ///
 /// Issue #116: deleting many files used to call the full-index-rewrite primitive once per
 /// file, making an incremental update O(changed_files × index_size). Batching collapses that
-/// to a single call; this counter lets regression tests assert the batching holds.
+/// to a single call; this counter lets regression tests assert the batching holds. Keyed by
+/// index path so concurrently running tests (each in its own tempdir) can't pollute each
+/// other's counts.
 #[cfg(test)]
-static DELETE_FROM_INDEX_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static DELETE_FROM_INDEX_CALLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Wrapper over [`next_plaid::delete_from_index`] that counts calls under `cfg(test)`.
 /// Zero overhead in release builds.
 fn delete_from_index_counted(ids: &[i64], index_path: &str) -> Result<usize> {
     #[cfg(test)]
-    DELETE_FROM_INDEX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut calls = DELETE_FROM_INDEX_CALLS.lock().unwrap();
+        *calls.entry(index_path.to_string()).or_insert(0) += 1;
+    }
     Ok(delete_from_index(ids, index_path)?)
 }
 
@@ -86,12 +92,14 @@ fn delete_from_index_counted(ids: &[i64], index_path: &str) -> Result<usize> {
 /// surviving documents, so interleaving reads and deletes would invalidate the IDs that haven't
 /// been deleted yet. Returns the number of documents removed.
 fn delete_files_from_index(index_path: &str, files: &[PathBuf]) -> Result<usize> {
-    if files.is_empty() {
-        return Ok(0);
-    }
+    let ids = collect_doc_ids_for_files(index_path, files);
+    delete_doc_ids_from_index(index_path, &ids)
+}
 
-    // Gather the doc IDs for every file first (dedup in case a path appears twice), then
-    // delete the whole set in one pass.
+/// Look up the doc IDs of every entry belonging to any of `files` (deduplicated, in
+/// query order). Read-only: callers must complete all ID lookups before any deletion,
+/// because deletes renumber the surviving documents.
+fn collect_doc_ids_for_files(index_path: &str, files: &[PathBuf]) -> Vec<i64> {
     let mut ids: Vec<i64> = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
     for file_path in files {
@@ -105,14 +113,331 @@ fn delete_files_from_index(index_path: &str, files: &[PathBuf]) -> Result<usize>
             }
         }
     }
+    ids
+}
 
+/// Delete a set of doc IDs from all three storage layers in one pass: the vector index,
+/// the SQLite metadata table, and the FTS5 mirror. Returns the number of documents removed.
+///
+/// The FTS5 step is required for correctness, not hygiene. FTS5 rowids mirror the
+/// `_subset_` IDs, and `filtering::delete` re-sequences every surviving ID — so after any
+/// delete that isn't exactly the tail of the ID space, every survivor's FTS row points at
+/// a *different* (renumbered) metadata row. Worse, later re-adds reuse the now-smaller ID
+/// range, and external-content FTS5 accepts duplicate-rowid inserts without error, leaving
+/// stale postings that silently corrupt hybrid ranking. Suffix deletes keep every
+/// survivor's ID, so only the deleted rows need removing — O(deleted); any other delete
+/// must rebuild the FTS index against the new numbering.
+fn delete_doc_ids_from_index(index_path: &str, ids: &[i64]) -> Result<usize> {
     if ids.is_empty() {
         return Ok(0);
     }
 
-    delete_from_index_counted(&ids, index_path)?;
-    filtering::delete(index_path, &ids)?;
-    Ok(ids.len())
+    let mut sorted_ids = ids.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+
+    // The suffix check must use the pre-delete document count.
+    let total_docs = filtering::count(index_path)? as i64;
+    let suffix_start = total_docs - sorted_ids.len() as i64;
+    let is_suffix_delete = sorted_ids.first().is_some_and(|&min| min >= suffix_start);
+
+    delete_from_index_counted(&sorted_ids, index_path)?;
+    filtering::delete(index_path, &sorted_ids)?;
+    if is_suffix_delete {
+        next_plaid::text_search::delete(index_path, &sorted_ids)?;
+    } else {
+        next_plaid::text_search::rebuild(index_path)?;
+    }
+    Ok(sorted_ids.len())
+}
+
+/// A unit's key within its file: the qualified name with the `<file>::` prefix
+/// stripped. Path-independent so renames don't invalidate stored fingerprints.
+fn unit_key(qualified_name: &str, file_display: &str) -> String {
+    let prefix = format!("{}::", file_display);
+    qualified_name
+        .strip_prefix(&prefix)
+        .unwrap_or(qualified_name)
+        .to_string()
+}
+
+/// Compute the stored fingerprint list for a freshly parsed file, in source-line
+/// order (the same order used to pair stored fingerprints with metadata-DB rows).
+fn file_unit_fingerprints(units: &[CodeUnit]) -> Vec<UnitFingerprint> {
+    let mut keyed: Vec<(usize, usize, String, u64)> = units
+        .iter()
+        .map(|u| {
+            (
+                u.line,
+                u.end_line,
+                unit_key(&u.qualified_name, &u.file.display().to_string()),
+                unit_fingerprint(u),
+            )
+        })
+        .collect();
+    keyed.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    keyed.into_iter().map(|(_, _, key, fp)| (key, fp)).collect()
+}
+
+/// One already-indexed unit of a changed file, read from the metadata DB.
+#[derive(Debug)]
+struct IndexedUnitRow {
+    doc_id: i64,
+    key: String,
+    line: i64,
+    end_line: i64,
+}
+
+/// A metadata-only correction for a unit whose embedding-relevant content is
+/// unchanged: applied as an in-place SQL UPDATE (with automatic FTS re-sync)
+/// instead of a delete + re-embed.
+#[derive(Debug)]
+struct UnitMetadataPatch {
+    doc_id: i64,
+    updates: serde_json::Value,
+}
+
+/// The outcome of diffing a changed file against its stored unit fingerprints.
+#[derive(Debug, Default)]
+struct FileDiff {
+    /// Units that must be (re-)embedded: new content or changed content.
+    to_embed: Vec<CodeUnit>,
+    /// Doc IDs whose content was changed or removed; delete before re-adding.
+    stale_doc_ids: Vec<i64>,
+    /// Units whose content is unchanged but whose position/name metadata moved.
+    patches: Vec<UnitMetadataPatch>,
+}
+
+/// Diff a changed file's freshly parsed units against the fingerprints stored at
+/// its last indexing. Returns `None` when the stored fingerprints can't be
+/// trusted (they don't line up 1:1 with the file's metadata-DB rows — e.g. a
+/// partially applied earlier run), in which case the caller falls back to
+/// whole-file re-embedding.
+///
+/// Matching is two passes:
+/// 1. By unit key and occurrence (both sides in source-line order): equal
+///    fingerprints are kept (with a metadata patch when lines shifted); unequal
+///    fingerprints are re-embedded.
+/// 2. Leftovers matched by fingerprint: a unit whose content is identical but
+///    whose key changed (RawCode gap units are keyed by start line, so every
+///    line shift renames them) is treated as moved and patched in place.
+fn diff_file_units(
+    old_units: &[UnitFingerprint],
+    mut db_rows: Vec<IndexedUnitRow>,
+    new_units: &[CodeUnit],
+    file_display: &str,
+) -> Option<FileDiff> {
+    use std::collections::VecDeque;
+
+    if old_units.len() != db_rows.len() {
+        return None;
+    }
+
+    // Pair each stored fingerprint with its DB row by (key, occurrence). Both
+    // sides are in source-line order from the same indexing run, so the k-th
+    // stored entry of a key is the k-th DB row of that key.
+    db_rows.sort_by(|a, b| {
+        (a.line, a.end_line, a.key.as_str()).cmp(&(b.line, b.end_line, b.key.as_str()))
+    });
+    let mut rows_by_key: HashMap<String, VecDeque<IndexedUnitRow>> = HashMap::new();
+    for row in db_rows {
+        rows_by_key
+            .entry(row.key.clone())
+            .or_default()
+            .push_back(row);
+    }
+    let mut old_indexed: HashMap<String, VecDeque<(u64, IndexedUnitRow)>> = HashMap::new();
+    for (key, fp) in old_units {
+        let row = rows_by_key.get_mut(key)?.pop_front()?;
+        old_indexed
+            .entry(key.clone())
+            .or_default()
+            .push_back((*fp, row));
+    }
+    if rows_by_key.values().any(|rows| !rows.is_empty()) {
+        return None;
+    }
+
+    let mut new_sorted: Vec<(String, u64, &CodeUnit)> = new_units
+        .iter()
+        .map(|unit| {
+            let key = unit_key(&unit.qualified_name, file_display);
+            let fp = unit_fingerprint(unit);
+            (key, fp, unit)
+        })
+        .collect();
+    new_sorted.sort_by(|a, b| {
+        (a.2.line, a.2.end_line, a.0.as_str()).cmp(&(b.2.line, b.2.end_line, b.0.as_str()))
+    });
+
+    let mut diff = FileDiff::default();
+    let mut leftover_new: Vec<(u64, &CodeUnit)> = Vec::new();
+
+    // Pass 1: same key, paired by occurrence in source-line order.
+    for (key, fp, unit) in new_sorted {
+        match old_indexed
+            .get_mut(&key)
+            .and_then(|queue| queue.pop_front())
+        {
+            Some((old_fp, row)) if old_fp == fp => {
+                // Content unchanged — refresh position metadata if the unit moved.
+                if row.line != unit.line as i64 || row.end_line != unit.end_line as i64 {
+                    diff.patches.push(UnitMetadataPatch {
+                        doc_id: row.doc_id,
+                        updates: serde_json::json!({
+                            "line": unit.line,
+                            "end_line": unit.end_line,
+                        }),
+                    });
+                }
+            }
+            Some((_, row)) => {
+                // Same key, new content: replace the old doc.
+                diff.stale_doc_ids.push(row.doc_id);
+                diff.to_embed.push(unit.clone());
+            }
+            None => leftover_new.push((fp, unit)),
+        }
+    }
+
+    let mut leftover_old: Vec<(u64, IndexedUnitRow)> =
+        old_indexed.into_values().flatten().collect();
+    leftover_old.sort_by_key(|(_, row)| (row.line, row.end_line, row.doc_id));
+
+    // Pass 2: leftovers matched by fingerprint — identical content under a new
+    // key is a move (RawCode gap units are keyed by start line), patched in place.
+    let mut movable: HashMap<u64, VecDeque<IndexedUnitRow>> = HashMap::new();
+    for (fp, row) in leftover_old {
+        movable.entry(fp).or_default().push_back(row);
+    }
+    for (fp, unit) in leftover_new {
+        match movable.get_mut(&fp).and_then(|queue| queue.pop_front()) {
+            Some(row) => diff.patches.push(UnitMetadataPatch {
+                doc_id: row.doc_id,
+                updates: serde_json::json!({
+                    "name": unit.name,
+                    "qualified_name": unit.qualified_name,
+                    "line": unit.line,
+                    "end_line": unit.end_line,
+                }),
+            }),
+            None => diff.to_embed.push(unit.clone()),
+        }
+    }
+    for queue in movable.into_values() {
+        for row in queue {
+            diff.stale_doc_ids.push(row.doc_id);
+        }
+    }
+
+    Some(diff)
+}
+
+/// Read the indexed units of one file from the metadata DB for diffing.
+/// `None` when any row lacks the needed columns (e.g. a legacy index).
+fn load_indexed_unit_rows(index_path: &str, file_display: &str) -> Option<Vec<IndexedUnitRow>> {
+    let rows = filtering::get(
+        index_path,
+        Some("file = ?"),
+        &[serde_json::json!(file_display)],
+        None,
+    )
+    .ok()?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        result.push(IndexedUnitRow {
+            doc_id: row.get("_subset_")?.as_i64()?,
+            key: unit_key(row.get("qualified_name")?.as_str()?, file_display),
+            line: row.get("line")?.as_i64()?,
+            end_line: row.get("end_line")?.as_i64()?,
+        });
+    }
+    Some(result)
+}
+
+/// Pair deleted paths with added paths whose content hash matches: the same
+/// bytes at a new location are a rename, handled as an in-place metadata update
+/// instead of a delete + re-embed of identical content.
+///
+/// Matching is exact-content only and 1:1 (first candidate in plan order wins);
+/// a rename that also edits the file is not detected and takes the normal
+/// delete + add path. Detected languages must match because the parser keys off
+/// the extension — foo.js → foo.ts must re-parse even with identical bytes.
+fn detect_renames(plan: &mut UpdatePlan, state: &IndexState, added_hashes: &HashMap<PathBuf, u64>) {
+    if plan.deleted.is_empty() || plan.added.is_empty() {
+        return;
+    }
+
+    let mut added_by_hash: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    for path in &plan.added {
+        if let Some(&hash) = added_hashes.get(path) {
+            added_by_hash.entry(hash).or_default().push(path.clone());
+        }
+    }
+
+    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut still_deleted: Vec<PathBuf> = Vec::new();
+    for old_path in plan.deleted.drain(..) {
+        let matched = state.files.get(&old_path).and_then(|info| {
+            let candidates = added_by_hash.get_mut(&info.content_hash)?;
+            let position = candidates
+                .iter()
+                .position(|new_path| detect_language(new_path) == detect_language(&old_path))?;
+            Some(candidates.remove(position))
+        });
+        match matched {
+            Some(new_path) => renamed.push((old_path, new_path)),
+            None => still_deleted.push(old_path),
+        }
+    }
+
+    plan.deleted = still_deleted;
+    let renamed_targets: HashSet<&PathBuf> = renamed.iter().map(|(_, new)| new).collect();
+    plan.added.retain(|path| !renamed_targets.contains(path));
+    plan.renamed = renamed;
+}
+
+/// Repoint every metadata row of `old_path` at `new_path` in place: the `file`
+/// column and the path prefix of `qualified_name` are rewritten via SQL UPDATEs
+/// (`filtering::update_where` re-syncs the FTS rows automatically). The stored
+/// vectors are untouched: the only path-derived embedding content is the
+/// normalized `File:` line, so a rename leaves at most a few stale path tokens
+/// in the vector until the unit next changes — a deliberate trade against
+/// re-encoding byte-identical content.
+fn rename_file_in_index(index_path: &str, old_path: &Path, new_path: &Path) -> Result<usize> {
+    let old_str = old_path.to_string_lossy().to_string();
+    let new_str = new_path.to_string_lossy().to_string();
+    let rows = filtering::get(
+        index_path,
+        Some("file = ?"),
+        &[serde_json::json!(old_str)],
+        None,
+    )?;
+
+    let old_prefix = format!("{}::", old_str);
+    for row in &rows {
+        let Some(doc_id) = row.get("_subset_").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let new_qualified = row
+            .get("qualified_name")
+            .and_then(|v| v.as_str())
+            .and_then(|qualified| qualified.strip_prefix(&old_prefix))
+            .map(|rest| format!("{}::{}", new_str, rest));
+
+        let updates = match new_qualified {
+            Some(qualified) => serde_json::json!({ "file": new_str, "qualified_name": qualified }),
+            None => serde_json::json!({ "file": new_str }),
+        };
+        filtering::update_where(
+            index_path,
+            "_subset_ = ?",
+            &[serde_json::json!(doc_id)],
+            &updates,
+        )?;
+    }
+    Ok(rows.len())
 }
 
 /// Decide whether a sibling worktree's index directory is a usable seed source, returning its
@@ -193,6 +518,7 @@ pub struct UpdateStats {
     pub added: usize,
     pub changed: usize,
     pub deleted: usize,
+    pub renamed: usize,
     pub unchanged: usize,
     pub skipped: usize,
 }
@@ -202,6 +528,9 @@ pub struct UpdatePlan {
     pub added: Vec<PathBuf>,
     pub changed: Vec<PathBuf>,
     pub deleted: Vec<PathBuf>,
+    /// (old path, new path) pairs with byte-identical content: applied as
+    /// in-place metadata updates instead of delete + re-embed.
+    pub renamed: Vec<(PathBuf, PathBuf)>,
     pub unchanged: usize,
 }
 
@@ -831,15 +1160,19 @@ fn parse_files_parallel(
                         let units = extract_units(path, &source, lang);
                         match hash_file(&full_path) {
                             Ok(content_hash) => match get_mtime(&full_path) {
-                                Ok(mtime) => ParsedFileResult {
-                                    path: path.clone(),
-                                    units,
-                                    file_info: Some(FileInfo {
-                                        content_hash,
-                                        mtime,
-                                    }),
-                                    skip_reason: None,
-                                },
+                                Ok(mtime) => {
+                                    let unit_fingerprints = file_unit_fingerprints(&units);
+                                    ParsedFileResult {
+                                        path: path.clone(),
+                                        units,
+                                        file_info: Some(FileInfo {
+                                            content_hash,
+                                            mtime,
+                                            units: unit_fingerprints,
+                                        }),
+                                        skip_reason: None,
+                                    }
+                                }
                                 Err(e) => ParsedFileResult {
                                     path: path.clone(),
                                     units: Vec::new(),
@@ -1327,6 +1660,9 @@ impl IndexBuilder {
                         FileInfo {
                             content_hash: hash,
                             mtime,
+                            // No fingerprints: these files fall back to
+                            // whole-file re-embedding when they next change.
+                            units: Vec::new(),
                         },
                     );
                 }
@@ -1583,6 +1919,7 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: 0,
                 unchanged: 0,
                 skipped: 0,
             });
@@ -1672,6 +2009,7 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: 0,
                 unchanged,
                 skipped: 0,
             });
@@ -1711,6 +2049,7 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: 0,
                 unchanged,
                 skipped: 0,
             });
@@ -1772,6 +2111,7 @@ impl IndexBuilder {
             added: files_added.len(),
             changed: files_changed.len(),
             deleted: 0,
+            renamed: 0,
             unchanged,
             skipped: 0,
         })
@@ -2093,6 +2433,7 @@ impl IndexBuilder {
             added,
             changed: 0,
             deleted: stale.len(),
+            renamed: 0,
             unchanged: already,
             skipped,
         })
@@ -2249,6 +2590,7 @@ impl IndexBuilder {
             added: files.len(),
             changed: 0,
             deleted: 0,
+            renamed: 0,
             unchanged: 0,
             skipped,
         })
@@ -2272,7 +2614,25 @@ impl IndexBuilder {
             }
         }
 
-        // 0. Clean up orphaned entries (files in index but not on disk).
+        let mut state = old_state.clone();
+
+        // 0. Apply renames first: byte-identical content at a new path needs only
+        // in-place metadata updates, never re-embedding. This must precede the
+        // orphan cleanup below, which would otherwise see the old paths' docs as
+        // orphans (the old path is gone from disk) and delete them.
+        for (old_path, new_path) in &plan.renamed {
+            rename_file_in_index(index_path, old_path, new_path)?;
+            if let Some(mut info) = state.files.remove(old_path) {
+                if let Ok(mtime) = get_mtime(&self.project_root.join(new_path)) {
+                    info.mtime = mtime;
+                }
+                // content_hash and unit fingerprints are path-independent and
+                // still valid for the new path.
+                state.files.insert(new_path.clone(), info);
+            }
+        }
+
+        // 1. Clean up orphaned entries (files in index but not on disk).
         // This handles directory deletion/rename and any inconsistencies, but it
         // queries every distinct file in the metadata DB and stats each one — too
         // expensive to run on every search. Deletions in the plan already cover the
@@ -2285,18 +2645,18 @@ impl IndexBuilder {
             0
         };
 
-        // Nothing to do
+        // Nothing (more) to do
         if plan.added.is_empty()
             && plan.changed.is_empty()
             && plan.deleted.is_empty()
             && orphaned_deleted == 0
         {
-            // If the previous run left the index dirty, the repair above already brought the
-            // store back in sync — so clear the flag now. Returning without persisting would
-            // leave the index permanently dirty, forcing a (costly) repair on every future
-            // run even though nothing is wrong. See issue #115.
-            if old_state.dirty {
-                let mut state = old_state.clone();
+            // Persist the re-keyed state after renames. And if the previous run
+            // left the index dirty, the repair above already brought the store
+            // back in sync — so clear the flag now. Returning without persisting
+            // would leave the index permanently dirty, forcing a (costly) repair
+            // on every future run even though nothing is wrong. See issue #115.
+            if old_state.dirty || !plan.renamed.is_empty() {
                 state.dirty = false;
                 state.save(&self.index_dir)?;
             }
@@ -2304,19 +2664,18 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: plan.renamed.len(),
                 unchanged: plan.unchanged,
                 skipped: 0,
             });
         }
-
-        let mut state = old_state.clone();
 
         if !plan.deleted.is_empty() || !plan.changed.is_empty() || !plan.added.is_empty() {
             state.dirty = true;
             state.save(&self.index_dir)?;
         }
 
-        // 1. Delete chunks for deleted files (safe — not re-adding these). Batched into a
+        // 2. Delete chunks for deleted files (safe — not re-adding these). Batched into a
         //    single index rewrite — see delete_files_from_index / issue #116.
         delete_files_from_index(index_path, &plan.deleted)?;
 
@@ -2337,7 +2696,7 @@ impl IndexBuilder {
             state.files.remove(&path);
         }
 
-        // 2. Index new/changed files (skip previously ignored files)
+        // 3. Index new/changed files (skip previously ignored files)
         let files_to_index: Vec<PathBuf> = plan
             .added
             .iter()
@@ -2346,7 +2705,7 @@ impl IndexBuilder {
             .cloned()
             .collect();
 
-        let mut new_units: Vec<CodeUnit> = Vec::new();
+        let mut parsed_files: Vec<(PathBuf, Vec<CodeUnit>)> = Vec::new();
 
         // Progress bar for parsing (only if there are files to index)
         let pb = if !files_to_index.is_empty() {
@@ -2374,9 +2733,9 @@ impl IndexBuilder {
                 continue;
             }
 
-            new_units.extend(parsed.units);
             if let Some(file_info) = parsed.file_info {
-                state.files.insert(parsed.path, file_info);
+                state.files.insert(parsed.path.clone(), file_info);
+                parsed_files.push((parsed.path, parsed.units));
             }
         }
         let parsing_interrupted = is_interrupted();
@@ -2400,9 +2759,67 @@ impl IndexBuilder {
             .collect();
         let _ = delete_files_from_index(index_path, &stale_skipped);
 
-        // 3. Add new units to index
+        // 4. Decide, per changed file, what actually needs re-embedding. Files with
+        // stored unit fingerprints are diffed unit-by-unit: unchanged units keep
+        // their docs (position-only moves become in-place metadata patches), and
+        // only changed/added units pay for encoding. Changed files without usable
+        // fingerprints fall back to whole-file delete + re-embed. The doc-ID
+        // lookups must all complete before any delete, because deletes renumber the
+        // surviving documents — note the stale_skipped delete above already ran.
+        let changed_set: HashSet<&PathBuf> = plan.changed.iter().collect();
+        let mut to_embed: Vec<CodeUnit> = Vec::new();
+        let mut stale_doc_ids: Vec<i64> = Vec::new();
+        let mut whole_file_deletes: Vec<PathBuf> = Vec::new();
+        let mut patches: Vec<UnitMetadataPatch> = Vec::new();
+
+        for (path, units) in parsed_files {
+            if !changed_set.contains(&path) {
+                // Newly added file: everything gets embedded, nothing to delete.
+                to_embed.extend(units);
+                continue;
+            }
+
+            let file_display = path.to_string_lossy().to_string();
+            let diff = old_state
+                .files
+                .get(&path)
+                .filter(|info| !info.units.is_empty())
+                .and_then(|info| {
+                    let rows = load_indexed_unit_rows(index_path, &file_display)?;
+                    diff_file_units(&info.units, rows, &units, &file_display)
+                });
+
+            match diff {
+                Some(diff) => {
+                    to_embed.extend(diff.to_embed);
+                    stale_doc_ids.extend(diff.stale_doc_ids);
+                    patches.extend(diff.patches);
+                }
+                None => {
+                    whole_file_deletes.push(path);
+                    to_embed.extend(units);
+                }
+            }
+        }
+
+        // Unchanged units that moved: patch their metadata in place (the UPDATE
+        // re-syncs the FTS row). Must run before the batched delete below, which
+        // would renumber the doc IDs the patches refer to.
+        for patch in &patches {
+            filtering::update_where(
+                index_path,
+                "_subset_ = ?",
+                &[serde_json::json!(patch.doc_id)],
+                &patch.updates,
+            )?;
+        }
+
+        stale_doc_ids.extend(collect_doc_ids_for_files(index_path, &whole_file_deletes));
+
+        // 5. Replace stale docs and add new units
         let mut was_interrupted = false;
-        if !new_units.is_empty() {
+        if !to_embed.is_empty() {
+            let mut new_units = to_embed;
             // Build call graph for new units
             build_call_graph(&mut new_units);
 
@@ -2437,11 +2854,11 @@ impl IndexBuilder {
             // Compute effective pool factor based on batch size
             let pool_factor = self.resolve_pool_factor(new_units.len());
 
-            // Delete changed files from index right before writing new data.
-            // Deferred from earlier to minimize the window where data is missing
-            // from the index (for concurrent readers and interrupt safety). Batched
-            // into a single index rewrite — see delete_files_from_index / issue #116.
-            delete_files_from_index(index_path, &plan.changed)?;
+            // Delete stale docs right before writing new data. Deferred from
+            // earlier to minimize the window where data is missing from the index
+            // (for concurrent readers and interrupt safety). Batched into a single
+            // index rewrite — see delete_doc_ids_from_index / issue #116.
+            delete_doc_ids_from_index(index_path, &stale_doc_ids)?;
 
             let sorted_units = prepare_units_for_encoding(&new_units, index_chunk_size);
             let pipeline_interrupted = self.run_encoding_pipeline(
@@ -2454,6 +2871,10 @@ impl IndexBuilder {
             was_interrupted |= pipeline_interrupted;
 
             pb.finish_and_clear();
+        } else {
+            // Nothing needs encoding, but removed units still need deleting
+            // (e.g. a changed file whose only edit was deleting a function).
+            delete_doc_ids_from_index(index_path, &stale_doc_ids)?;
         }
 
         if was_interrupted || is_interrupted() {
@@ -2469,6 +2890,7 @@ impl IndexBuilder {
             added: plan.added.len(),
             changed: plan.changed.len(),
             deleted: plan.deleted.len(),
+            renamed: plan.renamed.len(),
             unchanged: plan.unchanged,
             skipped: 0,
         })
@@ -2753,6 +3175,7 @@ impl IndexBuilder {
         let current_set: HashSet<_> = current_files.iter().cloned().collect();
 
         let mut plan = UpdatePlan::default();
+        let mut added_hashes: HashMap<PathBuf, u64> = HashMap::new();
 
         for path in &current_files {
             // Skip files that previously failed to parse (e.g. invalid UTF-8)
@@ -2784,7 +3207,10 @@ impl IndexBuilder {
             match state.files.get(path) {
                 Some(info) if info.content_hash == hash => plan.unchanged += 1,
                 Some(_) => plan.changed.push(path.clone()),
-                None => plan.added.push(path.clone()),
+                None => {
+                    added_hashes.insert(path.clone(), hash);
+                    plan.added.push(path.clone());
+                }
             }
         }
 
@@ -2793,6 +3219,10 @@ impl IndexBuilder {
                 plan.deleted.push(path.clone());
             }
         }
+
+        // The added-file hashes were just computed and the deleted files' old
+        // hashes are in `state`, so rename detection costs no extra I/O.
+        detect_renames(&mut plan, state, &added_hashes);
 
         Ok(plan)
     }
@@ -4296,6 +4726,7 @@ mod tests {
             FileInfo {
                 content_hash: 0xDEAD_BEEF,
                 mtime: get_mtime(&file_path).unwrap(),
+                units: Vec::new(),
             },
         );
 
@@ -4352,6 +4783,7 @@ mod tests {
                 FileInfo {
                     content_hash,
                     mtime,
+                    units: Vec::new(),
                 },
             );
             mismatched_mtimes.files.insert(
@@ -4359,6 +4791,7 @@ mod tests {
                 FileInfo {
                     content_hash,
                     mtime: mtime + 1,
+                    units: Vec::new(),
                 },
             );
         }
@@ -4393,6 +4826,66 @@ mod tests {
             hashed_every_file.as_secs_f64() / stat_only.as_secs_f64().max(f64::EPSILON),
             removed,
         );
+    }
+
+    /// Measures what the per-unit diff saves on a single-function edit in a
+    /// large file: how many units must be re-encoded with and without stored
+    /// fingerprints, plus the wall-clock cost of the diff itself (the new
+    /// overhead paid per changed file). Encoding dominates real update time
+    /// (one ONNX forward pass per unit), so "units to re-encode" is the cost
+    /// driver; the diff runs in microseconds.
+    ///
+    ///   cargo test -p colgrep --release measure_unit_diff -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing measurement; run manually in release mode"]
+    fn measure_unit_diff_reembed_savings() {
+        const FUNCTIONS: usize = 500;
+
+        let file = "big_module.py";
+        let mut source = String::new();
+        for i in 0..FUNCTIONS {
+            source.push_str(&format!(
+                "def func_{i:03}():\n    return {i} + compute_{i}()\n\n"
+            ));
+        }
+
+        let rel = PathBuf::from(file);
+        let old_units = extract_units(&rel, &source, Language::Python);
+        let fingerprints = file_unit_fingerprints(&old_units);
+        let db_rows: Vec<IndexedUnitRow> = old_units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| IndexedUnitRow {
+                doc_id: i as i64,
+                key: unit_key(&u.qualified_name, file),
+                line: u.line as i64,
+                end_line: u.end_line as i64,
+            })
+            .collect();
+
+        // Edit one function in the middle of the file.
+        let edited = source.replace("return 250 + compute_250()", "return 9000 + compute_250()");
+        assert_ne!(source, edited);
+        let new_units = extract_units(&rel, &edited, Language::Python);
+
+        let started = std::time::Instant::now();
+        let diff = diff_file_units(&fingerprints, db_rows, &new_units, file).unwrap();
+        let diff_cost = started.elapsed();
+
+        println!(
+            "single-function edit in a {}-unit file:\n  \
+             units re-encoded without fingerprints (old behavior): {}\n  \
+             units re-encoded with fingerprints:                   {}\n  \
+             docs deleted: {}   metadata patches: {}\n  \
+             diff overhead paid per changed file: {:?}",
+            new_units.len(),
+            new_units.len(),
+            diff.to_embed.len(),
+            diff.stale_doc_ids.len(),
+            diff.patches.len(),
+            diff_cost,
+        );
+        assert_eq!(diff.to_embed.len(), 1, "exactly the edited unit re-encodes");
     }
 
     #[test]
@@ -5023,13 +5516,13 @@ mod tests {
         }
     }
 
-    /// Build a small vector index + filtering DB at `index_path`, distributing `n` documents
-    /// evenly across `files` (each doc tagged with its file in the filtering DB). Model-free.
-    fn build_fixture_index(index_path: &str, files: &[&str], docs_per_file: usize) {
+    /// Build a small vector index + filtering DB + FTS5 mirror at `index_path` with one
+    /// document per metadata row (doc IDs 0..n in row order). Model-free.
+    fn build_fixture_index_with_metadata(index_path: &str, metadata: &[serde_json::Value]) {
         use ndarray::Array2;
         use next_plaid::IndexConfig;
 
-        let n = files.len() * docs_per_file;
+        let n = metadata.len();
         let mut embeddings: Vec<Array2<f32>> = Vec::new();
         for i in 0..n {
             let mut doc = Array2::<f32>::zeros((5, 32));
@@ -5060,11 +5553,41 @@ mod tests {
         };
         MmapIndex::create_with_kmeans(&embeddings, index_path, &config).unwrap();
 
-        let metadata: Vec<serde_json::Value> = (0..n)
-            .map(|i| serde_json::json!({ "file": files[i / docs_per_file] }))
-            .collect();
         let doc_ids: Vec<i64> = (0..n as i64).collect();
-        filtering::create(index_path, &metadata, &doc_ids).unwrap();
+        filtering::create(index_path, metadata, &doc_ids).unwrap();
+        next_plaid::text_search::index(
+            index_path,
+            metadata,
+            &doc_ids,
+            &next_plaid::FtsTokenizer::IdentifierAware,
+        )
+        .unwrap();
+    }
+
+    /// Build a small vector index + filtering DB + FTS5 mirror at `index_path`, distributing
+    /// `n` documents evenly across `files`. Each doc carries its file and a globally unique
+    /// FTS-searchable term `uniqword<doc_id>`. Model-free.
+    fn build_fixture_index(index_path: &str, files: &[&str], docs_per_file: usize) {
+        let n = files.len() * docs_per_file;
+        let metadata: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "file": files[i / docs_per_file],
+                    "code": format!("uniqword{}", i),
+                })
+            })
+            .collect();
+        build_fixture_index_with_metadata(index_path, &metadata);
+    }
+
+    /// The number of `delete_from_index` calls recorded against one index path.
+    fn delete_calls_for(index_path: &str) -> usize {
+        DELETE_FROM_INDEX_CALLS
+            .lock()
+            .unwrap()
+            .get(index_path)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Issue #116: deleting many files must collapse into a *single* full-index rewrite, not one
@@ -5072,8 +5595,6 @@ mod tests {
     /// for minutes). Asserts both the call count and that exactly the right documents survive.
     #[test]
     fn test_delete_files_from_index_is_a_single_rewrite() {
-        use std::sync::atomic::Ordering;
-
         let tmp = tempfile::tempdir().unwrap();
         let index_path = tmp.path().to_str().unwrap();
 
@@ -5084,9 +5605,9 @@ mod tests {
         // Delete three of the four files in one batched call.
         let to_delete: Vec<PathBuf> = ["a.rs", "b.rs", "c.rs"].iter().map(PathBuf::from).collect();
 
-        let before = DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed);
+        let before = delete_calls_for(index_path);
         let removed = delete_files_from_index(index_path, &to_delete).unwrap();
-        let calls = DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed) - before;
+        let calls = delete_calls_for(index_path) - before;
 
         assert_eq!(removed, 9, "should remove 3 files × 3 docs");
         assert_eq!(
@@ -5104,19 +5625,445 @@ mod tests {
     /// Deleting nothing (or only unknown files) must not rewrite the index at all.
     #[test]
     fn test_delete_files_from_index_noop_does_not_rewrite() {
-        use std::sync::atomic::Ordering;
-
         let tmp = tempfile::tempdir().unwrap();
         let index_path = tmp.path().to_str().unwrap();
         build_fixture_index(index_path, &["a.rs"], 2);
 
-        let before = DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed);
+        let before = delete_calls_for(index_path);
         assert_eq!(delete_files_from_index(index_path, &[]).unwrap(), 0);
         assert_eq!(
             delete_files_from_index(index_path, &[PathBuf::from("missing.rs")]).unwrap(),
             0
         );
-        assert_eq!(DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed) - before, 0);
+        assert_eq!(delete_calls_for(index_path) - before, 0);
+    }
+
+    /// The FTS5 mirror must stay aligned with the renumbered `_subset_` IDs after
+    /// colgrep deletes files (mirror of next-plaid's `test_delete_keeps_fts_aligned`).
+    /// `filtering::delete` re-sequences every surviving ID, so without FTS maintenance
+    /// a non-suffix delete leaves every survivor's FTS row pointing at a different
+    /// (renumbered) metadata row — silently, since SQLite reports no error.
+    #[test]
+    fn test_delete_files_keeps_fts_aligned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().to_str().unwrap();
+
+        // a.rs → docs 0,1; b.rs → docs 2,3; c.rs → docs 4,5
+        build_fixture_index(index_path, &["a.rs", "b.rs", "c.rs"], 2);
+
+        // Non-suffix delete: a.rs holds the *lowest* IDs, so all four survivors
+        // renumber (2,3,4,5 → 0,1,2,3) and the FTS index must be rebuilt.
+        delete_files_from_index(index_path, &[PathBuf::from("a.rs")]).unwrap();
+
+        // c.rs's first doc was id 4 and is now id 2; its FTS hit must land on the
+        // metadata row that actually holds that text.
+        let hits = next_plaid::text_search::search(index_path, "uniqword4", 10).unwrap();
+        assert_eq!(
+            hits.passage_ids,
+            vec![2],
+            "FTS hit must follow the renumbering"
+        );
+        let row = filtering::get(index_path, None, &[], Some(&[2])).unwrap();
+        assert_eq!(row[0]["code"], "uniqword4");
+        assert_eq!(row[0]["file"], "c.rs");
+
+        // The deleted file's terms must be gone entirely.
+        let gone = next_plaid::text_search::search(index_path, "uniqword0", 10).unwrap();
+        assert!(
+            gone.passage_ids.is_empty(),
+            "deleted docs must leave the FTS index"
+        );
+
+        // Suffix delete: c.rs now holds the tail IDs (2,3); survivors keep their IDs.
+        delete_files_from_index(index_path, &[PathBuf::from("c.rs")]).unwrap();
+        let hits = next_plaid::text_search::search(index_path, "uniqword2", 10).unwrap();
+        assert_eq!(hits.passage_ids, vec![0]);
+        let gone = next_plaid::text_search::search(index_path, "uniqword4", 10).unwrap();
+        assert!(gone.passage_ids.is_empty());
+    }
+
+    /// Re-adding documents after a non-suffix delete must not collide with stale FTS
+    /// rows. External-content FTS5 accepts duplicate-rowid inserts without error, so
+    /// before the delete path maintained the FTS mirror, a term from a *deleted*
+    /// document could still match at a rowid that now belongs to fresh content.
+    #[test]
+    fn test_readd_after_delete_does_not_leave_stale_fts_postings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().to_str().unwrap();
+
+        // a.rs → docs 0,1; b.rs → docs 2,3
+        build_fixture_index(index_path, &["a.rs", "b.rs"], 2);
+
+        // Non-suffix delete shrinks the ID space to 0,1 (b.rs renumbered).
+        delete_files_from_index(index_path, &[PathBuf::from("a.rs")]).unwrap();
+
+        // Re-add two docs for a new file at IDs 2,3 — the IDs the old b.rs rows
+        // occupied before the delete.
+        let metadata = vec![
+            serde_json::json!({ "file": "d.rs", "code": "freshword2" }),
+            serde_json::json!({ "file": "d.rs", "code": "freshword3" }),
+        ];
+        filtering::update(index_path, &metadata, &[2, 3]).unwrap();
+        next_plaid::text_search::index(
+            index_path,
+            &metadata,
+            &[2, 3],
+            &next_plaid::FtsTokenizer::IdentifierAware,
+        )
+        .unwrap();
+
+        // Pre-fix, the FTS index still held rowids 0..3 from before the delete, so the
+        // re-add at rowids 2,3 created duplicate FTS rows: a.rs's terms still matched
+        // (at rowids now owned by other content) and b.rs's old postings shadowed the
+        // fresh ones. Post-fix, every term resolves to exactly its current row.
+        let stale = next_plaid::text_search::search(index_path, "uniqword0", 10).unwrap();
+        assert!(
+            stale.passage_ids.is_empty(),
+            "terms of the deleted file must not match any rowid after the re-add"
+        );
+        let moved = next_plaid::text_search::search(index_path, "uniqword3", 10).unwrap();
+        assert_eq!(
+            moved.passage_ids,
+            vec![1],
+            "surviving b.rs term must resolve to its renumbered row, not its old rowid"
+        );
+        let fresh = next_plaid::text_search::search(index_path, "freshword2", 10).unwrap();
+        assert_eq!(fresh.passage_ids, vec![2]);
+        let row = filtering::get(index_path, None, &[], Some(&[2])).unwrap();
+        assert_eq!(row[0]["file"], "d.rs");
+    }
+
+    fn diff_test_unit(
+        file: &str,
+        name: &str,
+        code: &str,
+        line: usize,
+        end_line: usize,
+    ) -> CodeUnit {
+        let mut unit = CodeUnit::new(
+            name.to_string(),
+            file.into(),
+            line,
+            end_line,
+            crate::parser::Language::Python,
+            crate::parser::UnitType::Function,
+            None,
+        );
+        unit.signature = format!("def {name}()");
+        unit.code = code.to_string();
+        unit
+    }
+
+    fn db_row(doc_id: i64, key: &str, line: i64, end_line: i64) -> IndexedUnitRow {
+        IndexedUnitRow {
+            doc_id,
+            key: key.to_string(),
+            line,
+            end_line,
+        }
+    }
+
+    /// Pass 1 of the unit diff: unchanged content with shifted lines becomes a
+    /// metadata patch; changed content becomes a delete + re-embed.
+    #[test]
+    fn test_diff_file_units_patches_moves_and_replaces_changes() {
+        let file = "calc.py";
+        let old_f = diff_test_unit(file, "f", "def f():\n    return 1", 1, 2);
+        let old_g = diff_test_unit(file, "g", "def g():\n    return 2", 4, 5);
+        let old_units = file_unit_fingerprints(&[old_f, old_g]);
+        let db_rows = vec![db_row(0, "f", 1, 2), db_row(1, "g", 4, 5)];
+
+        // f edited in place; g shifted down two lines, content unchanged.
+        let new_f = diff_test_unit(file, "f", "def f():\n    return 10", 1, 2);
+        let new_g = diff_test_unit(file, "g", "def g():\n    return 2", 6, 7);
+
+        let diff = diff_file_units(&old_units, db_rows, &[new_f, new_g], file).unwrap();
+
+        assert_eq!(diff.stale_doc_ids, vec![0], "edited f must be replaced");
+        assert_eq!(diff.to_embed.len(), 1);
+        assert_eq!(diff.to_embed[0].name, "f");
+        assert_eq!(diff.patches.len(), 1, "moved g needs only a metadata patch");
+        assert_eq!(diff.patches[0].doc_id, 1);
+        assert_eq!(diff.patches[0].updates["line"], 6);
+        assert_eq!(diff.patches[0].updates["end_line"], 7);
+    }
+
+    #[test]
+    fn test_diff_file_units_handles_added_and_removed_units() {
+        let file = "calc.py";
+        let f = diff_test_unit(file, "f", "def f():\n    return 1", 1, 2);
+        let g = diff_test_unit(file, "g", "def g():\n    return 2", 4, 5);
+        let old_units = file_unit_fingerprints(&[f.clone(), g]);
+        let db_rows = vec![db_row(0, "f", 1, 2), db_row(1, "g", 4, 5)];
+
+        // g removed, h added; f untouched.
+        let h = diff_test_unit(file, "h", "def h():\n    return 3", 4, 5);
+        let diff = diff_file_units(&old_units, db_rows, &[f, h], file).unwrap();
+
+        assert_eq!(
+            diff.stale_doc_ids,
+            vec![1],
+            "removed g's doc must be deleted"
+        );
+        assert_eq!(diff.to_embed.len(), 1);
+        assert_eq!(diff.to_embed[0].name, "h");
+        assert!(diff.patches.is_empty(), "untouched f needs no patch");
+    }
+
+    /// RawCode gap units are keyed by their start line, so a pure shift renames
+    /// them. Pass 2 must recognize the identical content under the new key and
+    /// patch it in place instead of deleting and re-embedding.
+    #[test]
+    fn test_diff_file_units_moves_renamed_raw_code_blocks() {
+        let file = "script.py";
+        let mut old_raw = diff_test_unit(file, "raw_code_3", "x = 1", 3, 3);
+        old_raw.unit_type = crate::parser::UnitType::RawCode;
+        let old_units = file_unit_fingerprints(&[old_raw]);
+        let db_rows = vec![db_row(0, "raw_code_3", 3, 3)];
+
+        let mut new_raw = diff_test_unit(file, "raw_code_9", "x = 1", 9, 9);
+        new_raw.unit_type = crate::parser::UnitType::RawCode;
+
+        let diff = diff_file_units(&old_units, db_rows, &[new_raw], file).unwrap();
+
+        assert!(diff.stale_doc_ids.is_empty());
+        assert!(diff.to_embed.is_empty());
+        assert_eq!(diff.patches.len(), 1);
+        assert_eq!(
+            diff.patches[0].updates["qualified_name"],
+            "script.py::raw_code_9"
+        );
+        assert_eq!(diff.patches[0].updates["name"], "raw_code_9");
+        assert_eq!(diff.patches[0].updates["line"], 9);
+    }
+
+    /// Stored fingerprints that don't line up 1:1 with the file's metadata-DB
+    /// rows can't be trusted (e.g. an interrupted earlier run) → `None`, which
+    /// sends the caller down the whole-file re-embed fallback.
+    #[test]
+    fn test_diff_file_units_rejects_mismatched_db_rows() {
+        let file = "calc.py";
+        let f = diff_test_unit(file, "f", "def f():\n    return 1", 1, 2);
+        let old_units = file_unit_fingerprints(std::slice::from_ref(&f));
+
+        assert!(diff_file_units(&old_units, vec![], std::slice::from_ref(&f), file).is_none());
+        let extra_row = vec![db_row(0, "f", 1, 2), db_row(1, "f", 3, 4)];
+        assert!(diff_file_units(&old_units, extra_row, std::slice::from_ref(&f), file).is_none());
+        let wrong_key = vec![db_row(0, "other", 1, 2)];
+        assert!(diff_file_units(&old_units, wrong_key, std::slice::from_ref(&f), file).is_none());
+    }
+
+    /// Sets up a real (model-free) index for `calc.py` containing functions f and
+    /// g, plus an IndexState carrying their unit fingerprints. The stored mtime is
+    /// zeroed so a subsequent rewrite of the file is detected through the content
+    /// hash regardless of filesystem timestamp resolution.
+    fn setup_unit_diff_project(
+        proj: &Path,
+        idx: &Path,
+    ) -> (PathBuf, PathBuf, Vec<CodeUnit>, IndexState) {
+        let rel = PathBuf::from("calc.py");
+        let full = proj.join(&rel);
+        let original = "def f():\n    return 1\n\n\ndef g():\n    return 2\n";
+        std::fs::write(&full, original).unwrap();
+
+        let units = extract_units(&rel, original, Language::Python);
+        assert_eq!(units.len(), 2, "fixture expects exactly f and g");
+
+        let vector = get_vector_index_path(idx);
+        std::fs::create_dir_all(&vector).unwrap();
+        let metadata: Vec<serde_json::Value> = units
+            .iter()
+            .map(|u| serde_json::to_value(u).unwrap())
+            .collect();
+        build_fixture_index_with_metadata(vector.to_str().unwrap(), &metadata);
+
+        let mut state = IndexState::default();
+        state.files.insert(
+            rel.clone(),
+            FileInfo {
+                content_hash: hash_file(&full).unwrap(),
+                mtime: 0,
+                units: file_unit_fingerprints(&units),
+            },
+        );
+
+        (rel, vector, units, state)
+    }
+
+    /// End-to-end, model-free: deleting one function from a file removes only that
+    /// unit's doc. The surviving unit's fingerprint is unchanged, so nothing needs
+    /// the embedding model — the test builder's model path is nonexistent on
+    /// purpose, proving no re-embedding happened.
+    #[test]
+    fn test_incremental_update_deletes_only_removed_units() {
+        let proj = tempfile::tempdir().unwrap();
+        let idx = tempfile::tempdir().unwrap();
+        let (rel, vector, _units, state) = setup_unit_diff_project(proj.path(), idx.path());
+
+        std::fs::write(proj.path().join(&rel), "def f():\n    return 1\n").unwrap();
+
+        let mut builder = test_builder(proj.path(), idx.path());
+        let stats = builder.incremental_update(&state, None).unwrap();
+
+        assert_eq!(stats.changed, 1);
+        let index_path = vector.to_str().unwrap();
+        assert_eq!(filtering::count(index_path).unwrap(), 1);
+        let names = filtering::get_distinct_strings(index_path, "qualified_name").unwrap();
+        assert_eq!(names, vec!["calc.py::f".to_string()]);
+        assert_eq!(
+            MmapIndex::load(index_path).unwrap().metadata.num_documents,
+            1
+        );
+
+        let saved = IndexState::load(idx.path()).unwrap();
+        assert_eq!(
+            saved.files.get(&rel).unwrap().units.len(),
+            1,
+            "saved fingerprints must reflect the new parse"
+        );
+    }
+
+    /// End-to-end, model-free: inserting blank lines shifts a unit without
+    /// changing its content. Its doc must be patched in place (fresh line numbers
+    /// in the metadata DB) with no deletes and no re-embedding.
+    #[test]
+    fn test_incremental_update_patches_shifted_units_in_place() {
+        let proj = tempfile::tempdir().unwrap();
+        let idx = tempfile::tempdir().unwrap();
+        let (rel, vector, _units, state) = setup_unit_diff_project(proj.path(), idx.path());
+
+        let shifted = "def f():\n    return 1\n\n\n\n\ndef g():\n    return 2\n";
+        std::fs::write(proj.path().join(&rel), shifted).unwrap();
+        let new_g_line = extract_units(&rel, shifted, Language::Python)
+            .iter()
+            .find(|u| u.name == "g")
+            .unwrap()
+            .line;
+
+        let mut builder = test_builder(proj.path(), idx.path());
+        let stats = builder.incremental_update(&state, None).unwrap();
+
+        assert_eq!(stats.changed, 1);
+        let index_path = vector.to_str().unwrap();
+        assert_eq!(filtering::count(index_path).unwrap(), 2, "no docs deleted");
+        let rows = filtering::get(
+            index_path,
+            Some("qualified_name = ?"),
+            &[serde_json::json!("calc.py::g")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["line"], serde_json::json!(new_g_line));
+        assert_eq!(
+            MmapIndex::load(index_path).unwrap().metadata.num_documents,
+            2
+        );
+    }
+
+    /// A deleted path and an added path with the same content hash and the same
+    /// detected language must be planned as a rename, not a delete + add.
+    #[test]
+    fn test_update_plan_detects_renames() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = "def f():\n    return 1\n";
+        std::fs::write(temp.path().join("renamed.py"), content).unwrap();
+
+        let builder = test_builder(temp.path(), &temp.path().join("index"));
+
+        let mut state = IndexState::default();
+        state.files.insert(
+            PathBuf::from("original.py"),
+            FileInfo {
+                content_hash: xxhash_rust::xxh3::xxh3_64(content.as_bytes()),
+                mtime: 0,
+                units: Vec::new(),
+            },
+        );
+
+        let plan = builder.compute_update_plan(&state, None).unwrap();
+        assert_eq!(
+            plan.renamed,
+            vec![(PathBuf::from("original.py"), PathBuf::from("renamed.py"))]
+        );
+        assert!(plan.added.is_empty(), "renamed file must leave `added`");
+        assert!(plan.deleted.is_empty(), "renamed file must leave `deleted`");
+    }
+
+    /// Identical bytes under a different extension are NOT a rename: the parser
+    /// keys off the extension, so the file must be re-parsed and re-embedded.
+    #[test]
+    fn test_update_plan_rename_requires_same_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = "# same bytes\n";
+        std::fs::write(temp.path().join("config.rb"), content).unwrap();
+
+        let builder = test_builder(temp.path(), &temp.path().join("index"));
+
+        let mut state = IndexState::default();
+        state.files.insert(
+            PathBuf::from("config.py"),
+            FileInfo {
+                content_hash: xxhash_rust::xxh3::xxh3_64(content.as_bytes()),
+                mtime: 0,
+                units: Vec::new(),
+            },
+        );
+
+        let plan = builder.compute_update_plan(&state, None).unwrap();
+        assert!(plan.renamed.is_empty());
+        assert_eq!(plan.added, vec![PathBuf::from("config.rb")]);
+        assert_eq!(plan.deleted, vec![PathBuf::from("config.py")]);
+    }
+
+    /// End-to-end, model-free: renaming a file on disk repoints its metadata rows
+    /// (file + qualified_name) in place and re-keys the state entry — no docs are
+    /// deleted, nothing is re-embedded, and the stored unit fingerprints survive
+    /// under the new path.
+    #[test]
+    fn test_incremental_update_applies_renames_in_place() {
+        let proj = tempfile::tempdir().unwrap();
+        let idx = tempfile::tempdir().unwrap();
+        let (rel, vector, _units, state) = setup_unit_diff_project(proj.path(), idx.path());
+
+        std::fs::rename(proj.path().join(&rel), proj.path().join("util.py")).unwrap();
+
+        let mut builder = test_builder(proj.path(), idx.path());
+        let stats = builder.incremental_update(&state, None).unwrap();
+
+        assert_eq!(stats.renamed, 1);
+        assert_eq!(stats.added, 0);
+        assert_eq!(stats.changed, 0);
+        assert_eq!(stats.deleted, 0);
+
+        let index_path = vector.to_str().unwrap();
+        assert_eq!(filtering::count(index_path).unwrap(), 2, "no docs deleted");
+        let files = filtering::get_distinct_strings(index_path, "file").unwrap();
+        assert_eq!(files, vec!["util.py".to_string()]);
+        let mut names = filtering::get_distinct_strings(index_path, "qualified_name").unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["util.py::f".to_string(), "util.py::g".to_string()]
+        );
+        assert_eq!(
+            MmapIndex::load(index_path).unwrap().metadata.num_documents,
+            2,
+            "vectors must be untouched"
+        );
+
+        // FTS rows were re-synced by the UPDATE: the new path is searchable.
+        let hits = next_plaid::text_search::search(index_path, "util", 10).unwrap();
+        assert_eq!(hits.passage_ids.len(), 2);
+
+        let saved = IndexState::load(idx.path()).unwrap();
+        assert!(!saved.files.contains_key(&rel));
+        let new_info = saved.files.get(&PathBuf::from("util.py")).unwrap();
+        assert_eq!(
+            new_info.units.len(),
+            2,
+            "unit fingerprints must survive the re-key"
+        );
     }
 
     /// Issue #115 (bug 1): an index left dirty by an interrupted run must be cleaned once the
@@ -5169,6 +6116,7 @@ mod tests {
             FileInfo {
                 content_hash: 1,
                 mtime: 1,
+                units: Vec::new(),
             },
         );
         state.save(src_dir).unwrap(); // save() stamps the current format version

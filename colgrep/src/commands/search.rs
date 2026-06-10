@@ -1142,7 +1142,7 @@ fn search_single_path(
         // Try non-blocking index update
         match builder.try_index(None, false) {
             Ok(Some(stats)) => {
-                let changes = stats.added + stats.changed + stats.deleted;
+                let changes = stats.added + stats.changed + stats.deleted + stats.renamed;
                 if changes > 0 && !json && !files_only {
                     if let Some(ref info) = parent_info {
                         eprintln!(

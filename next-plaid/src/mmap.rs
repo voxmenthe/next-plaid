@@ -424,8 +424,8 @@ fn parse_dtype_from_header(header: &str) -> Result<String> {
     Ok(rest[..quote_end].to_string())
 }
 
-/// Detect NPY file dtype without loading the entire file
-pub fn detect_npy_dtype(path: &Path) -> Result<String> {
+/// Read an NPY file's header string without loading the data section.
+fn read_npy_header(path: &Path) -> Result<String> {
     let file = File::open(path)
         .map_err(|e| Error::IndexLoad(format!("Failed to open NPY file {:?}: {}", path, e)))?;
 
@@ -474,7 +474,17 @@ pub fn detect_npy_dtype(path: &Path) -> Result<String> {
     let header_str = std::str::from_utf8(&mmap[header_start..header_end])
         .map_err(|e| Error::IndexLoad(format!("Invalid NPY header encoding: {}", e)))?;
 
-    parse_dtype_from_header(header_str)
+    Ok(header_str.to_string())
+}
+
+/// Detect NPY file dtype without loading the entire file
+pub fn detect_npy_dtype(path: &Path) -> Result<String> {
+    parse_dtype_from_header(&read_npy_header(path)?)
+}
+
+/// Read an NPY file's array shape from its header without loading the data.
+pub fn read_npy_shape(path: &Path) -> Result<Vec<usize>> {
+    parse_shape_from_header(&read_npy_header(path)?)
 }
 
 /// Convert a float16 NPY file to float32 in place
@@ -1321,10 +1331,16 @@ pub fn merge_codes_chunks(
         if path.exists() {
             let mtime = get_mtime(&path)?;
 
-            // Get shape by reading header only
-            let file = File::open(&path)?;
-            let arr: Array1<i64> = Array1::read_npy(file)?;
-            let rows = arr.len();
+            // Row count from the NPY header only — reading the full array here
+            // made every re-merge scan O(index bytes) before any work started.
+            let shape = read_npy_shape(&path)?;
+            if shape.len() != 1 {
+                return Err(Error::IndexLoad(format!(
+                    "Expected 1-D codes array in {:?}, got shape {:?}",
+                    path, shape
+                )));
+            }
+            let rows = shape[0];
 
             if rows > 0 {
                 total_rows += rows;
@@ -1539,11 +1555,17 @@ pub fn merge_residuals_chunks(
         if path.exists() {
             let mtime = get_mtime(&path)?;
 
-            // Get shape by reading header
-            let file = File::open(&path)?;
-            let arr: Array2<u8> = Array2::read_npy(file)?;
-            let rows = arr.nrows();
-            ncols = arr.ncols();
+            // Row count from the NPY header only — reading the full array here
+            // made every re-merge scan O(index bytes) before any work started.
+            let shape = read_npy_shape(&path)?;
+            if shape.len() != 2 {
+                return Err(Error::IndexLoad(format!(
+                    "Expected 2-D residuals array in {:?}, got shape {:?}",
+                    path, shape
+                )));
+            }
+            let rows = shape[0];
+            ncols = shape[1];
 
             if rows > 0 {
                 total_rows += rows;
@@ -1885,5 +1907,26 @@ mod tests {
         let loaded = mmap.to_owned();
 
         assert_eq!(array, loaded);
+    }
+
+    /// read_npy_shape must report the same shapes a full deserialization would,
+    /// for both the 1-D (codes) and 2-D (residuals) layouts the merge scan reads.
+    #[test]
+    fn test_read_npy_shape_matches_full_read() {
+        use ndarray_npy::WriteNpyExt;
+
+        let codes_file = NamedTempFile::new().unwrap();
+        let codes = Array1::from_vec(vec![1i64, 2, 3, 4, 5]);
+        codes
+            .write_npy(File::create(codes_file.path()).unwrap())
+            .unwrap();
+        assert_eq!(read_npy_shape(codes_file.path()).unwrap(), vec![5]);
+
+        let residuals_file = NamedTempFile::new().unwrap();
+        let residuals = Array2::from_shape_vec((3, 4), vec![0u8; 12]).unwrap();
+        residuals
+            .write_npy(File::create(residuals_file.path()).unwrap())
+            .unwrap();
+        assert_eq!(read_npy_shape(residuals_file.path()).unwrap(), vec![3, 4]);
     }
 }

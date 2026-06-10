@@ -76,25 +76,27 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     }
     let stats = builder.index(None, false)?;
 
-    let changes = stats.added + stats.changed + stats.deleted;
+    let changes = stats.added + stats.changed + stats.deleted + stats.renamed;
     if changes > 0 {
         if let Some(ref info) = parent_info {
             eprintln!(
-                "Indexed {} (subdir: {}) (added: {}, changed: {}, deleted: {}, unchanged: {})",
+                "Indexed {} (subdir: {}) (added: {}, changed: {}, deleted: {}, renamed: {}, unchanged: {})",
                 info.project_path.display(),
                 info.relative_subdir.display(),
                 stats.added,
                 stats.changed,
                 stats.deleted,
+                stats.renamed,
                 stats.unchanged,
             );
         } else {
             eprintln!(
-                "Indexed {} (added: {}, changed: {}, deleted: {}, unchanged: {})",
+                "Indexed {} (added: {}, changed: {}, deleted: {}, renamed: {}, unchanged: {})",
                 effective_root.display(),
                 stats.added,
                 stats.changed,
                 stats.deleted,
+                stats.renamed,
                 stats.unchanged,
             );
         }
