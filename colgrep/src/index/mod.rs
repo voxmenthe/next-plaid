@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "cuda")]
 use crate::acceleration::apply_acceleration_mode;
 use crate::acceleration::{env_acceleration_mode_lossy, AccelerationMode};
-use crate::embed::build_embedding_text;
+use crate::embed::{build_embedding_text, unit_fingerprint};
 use crate::parser::{build_call_graph, detect_language, extract_units, CodeUnit, Language};
 use crate::signal::{is_interrupted, is_interrupted_outside_critical, CriticalSectionGuard};
 
@@ -32,7 +32,7 @@ use paths::{
     acquire_index_lock, get_index_dir_for_project, get_vector_index_path, try_acquire_index_lock,
     ProjectMetadata,
 };
-use state::{get_mtime, hash_file, FileInfo, IndexState, INDEX_FORMAT_VERSION};
+use state::{get_mtime, hash_file, FileInfo, IndexState, UnitFingerprint, INDEX_FORMAT_VERSION};
 
 /// Maximum file size to index (512 KB)
 /// Files larger than this are skipped to avoid:
@@ -149,6 +149,211 @@ fn delete_doc_ids_from_index(index_path: &str, ids: &[i64]) -> Result<usize> {
         next_plaid::text_search::rebuild(index_path)?;
     }
     Ok(sorted_ids.len())
+}
+
+/// A unit's key within its file: the qualified name with the `<file>::` prefix
+/// stripped. Path-independent so renames don't invalidate stored fingerprints.
+fn unit_key(qualified_name: &str, file_display: &str) -> String {
+    let prefix = format!("{}::", file_display);
+    qualified_name
+        .strip_prefix(&prefix)
+        .unwrap_or(qualified_name)
+        .to_string()
+}
+
+/// Compute the stored fingerprint list for a freshly parsed file, in source-line
+/// order (the same order used to pair stored fingerprints with metadata-DB rows).
+fn file_unit_fingerprints(units: &[CodeUnit]) -> Vec<UnitFingerprint> {
+    let mut keyed: Vec<(usize, usize, String, u64)> = units
+        .iter()
+        .map(|u| {
+            (
+                u.line,
+                u.end_line,
+                unit_key(&u.qualified_name, &u.file.display().to_string()),
+                unit_fingerprint(u),
+            )
+        })
+        .collect();
+    keyed.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    keyed.into_iter().map(|(_, _, key, fp)| (key, fp)).collect()
+}
+
+/// One already-indexed unit of a changed file, read from the metadata DB.
+#[derive(Debug)]
+struct IndexedUnitRow {
+    doc_id: i64,
+    key: String,
+    line: i64,
+    end_line: i64,
+}
+
+/// A metadata-only correction for a unit whose embedding-relevant content is
+/// unchanged: applied as an in-place SQL UPDATE (with automatic FTS re-sync)
+/// instead of a delete + re-embed.
+#[derive(Debug)]
+struct UnitMetadataPatch {
+    doc_id: i64,
+    updates: serde_json::Value,
+}
+
+/// The outcome of diffing a changed file against its stored unit fingerprints.
+#[derive(Debug, Default)]
+struct FileDiff {
+    /// Units that must be (re-)embedded: new content or changed content.
+    to_embed: Vec<CodeUnit>,
+    /// Doc IDs whose content was changed or removed; delete before re-adding.
+    stale_doc_ids: Vec<i64>,
+    /// Units whose content is unchanged but whose position/name metadata moved.
+    patches: Vec<UnitMetadataPatch>,
+}
+
+/// Diff a changed file's freshly parsed units against the fingerprints stored at
+/// its last indexing. Returns `None` when the stored fingerprints can't be
+/// trusted (they don't line up 1:1 with the file's metadata-DB rows — e.g. a
+/// partially applied earlier run), in which case the caller falls back to
+/// whole-file re-embedding.
+///
+/// Matching is two passes:
+/// 1. By unit key and occurrence (both sides in source-line order): equal
+///    fingerprints are kept (with a metadata patch when lines shifted); unequal
+///    fingerprints are re-embedded.
+/// 2. Leftovers matched by fingerprint: a unit whose content is identical but
+///    whose key changed (RawCode gap units are keyed by start line, so every
+///    line shift renames them) is treated as moved and patched in place.
+fn diff_file_units(
+    old_units: &[UnitFingerprint],
+    mut db_rows: Vec<IndexedUnitRow>,
+    new_units: &[CodeUnit],
+    file_display: &str,
+) -> Option<FileDiff> {
+    use std::collections::VecDeque;
+
+    if old_units.len() != db_rows.len() {
+        return None;
+    }
+
+    // Pair each stored fingerprint with its DB row by (key, occurrence). Both
+    // sides are in source-line order from the same indexing run, so the k-th
+    // stored entry of a key is the k-th DB row of that key.
+    db_rows.sort_by(|a, b| {
+        (a.line, a.end_line, a.key.as_str()).cmp(&(b.line, b.end_line, b.key.as_str()))
+    });
+    let mut rows_by_key: HashMap<String, VecDeque<IndexedUnitRow>> = HashMap::new();
+    for row in db_rows {
+        rows_by_key
+            .entry(row.key.clone())
+            .or_default()
+            .push_back(row);
+    }
+    let mut old_indexed: HashMap<String, VecDeque<(u64, IndexedUnitRow)>> = HashMap::new();
+    for (key, fp) in old_units {
+        let row = rows_by_key.get_mut(key)?.pop_front()?;
+        old_indexed
+            .entry(key.clone())
+            .or_default()
+            .push_back((*fp, row));
+    }
+    if rows_by_key.values().any(|rows| !rows.is_empty()) {
+        return None;
+    }
+
+    let mut new_sorted: Vec<(String, u64, &CodeUnit)> = new_units
+        .iter()
+        .map(|unit| {
+            let key = unit_key(&unit.qualified_name, file_display);
+            let fp = unit_fingerprint(unit);
+            (key, fp, unit)
+        })
+        .collect();
+    new_sorted.sort_by(|a, b| {
+        (a.2.line, a.2.end_line, a.0.as_str()).cmp(&(b.2.line, b.2.end_line, b.0.as_str()))
+    });
+
+    let mut diff = FileDiff::default();
+    let mut leftover_new: Vec<(u64, &CodeUnit)> = Vec::new();
+
+    // Pass 1: same key, paired by occurrence in source-line order.
+    for (key, fp, unit) in new_sorted {
+        match old_indexed
+            .get_mut(&key)
+            .and_then(|queue| queue.pop_front())
+        {
+            Some((old_fp, row)) if old_fp == fp => {
+                // Content unchanged — refresh position metadata if the unit moved.
+                if row.line != unit.line as i64 || row.end_line != unit.end_line as i64 {
+                    diff.patches.push(UnitMetadataPatch {
+                        doc_id: row.doc_id,
+                        updates: serde_json::json!({
+                            "line": unit.line,
+                            "end_line": unit.end_line,
+                        }),
+                    });
+                }
+            }
+            Some((_, row)) => {
+                // Same key, new content: replace the old doc.
+                diff.stale_doc_ids.push(row.doc_id);
+                diff.to_embed.push(unit.clone());
+            }
+            None => leftover_new.push((fp, unit)),
+        }
+    }
+
+    let mut leftover_old: Vec<(u64, IndexedUnitRow)> =
+        old_indexed.into_values().flatten().collect();
+    leftover_old.sort_by_key(|(_, row)| (row.line, row.end_line, row.doc_id));
+
+    // Pass 2: leftovers matched by fingerprint — identical content under a new
+    // key is a move (RawCode gap units are keyed by start line), patched in place.
+    let mut movable: HashMap<u64, VecDeque<IndexedUnitRow>> = HashMap::new();
+    for (fp, row) in leftover_old {
+        movable.entry(fp).or_default().push_back(row);
+    }
+    for (fp, unit) in leftover_new {
+        match movable.get_mut(&fp).and_then(|queue| queue.pop_front()) {
+            Some(row) => diff.patches.push(UnitMetadataPatch {
+                doc_id: row.doc_id,
+                updates: serde_json::json!({
+                    "name": unit.name,
+                    "qualified_name": unit.qualified_name,
+                    "line": unit.line,
+                    "end_line": unit.end_line,
+                }),
+            }),
+            None => diff.to_embed.push(unit.clone()),
+        }
+    }
+    for queue in movable.into_values() {
+        for row in queue {
+            diff.stale_doc_ids.push(row.doc_id);
+        }
+    }
+
+    Some(diff)
+}
+
+/// Read the indexed units of one file from the metadata DB for diffing.
+/// `None` when any row lacks the needed columns (e.g. a legacy index).
+fn load_indexed_unit_rows(index_path: &str, file_display: &str) -> Option<Vec<IndexedUnitRow>> {
+    let rows = filtering::get(
+        index_path,
+        Some("file = ?"),
+        &[serde_json::json!(file_display)],
+        None,
+    )
+    .ok()?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        result.push(IndexedUnitRow {
+            doc_id: row.get("_subset_")?.as_i64()?,
+            key: unit_key(row.get("qualified_name")?.as_str()?, file_display),
+            line: row.get("line")?.as_i64()?,
+            end_line: row.get("end_line")?.as_i64()?,
+        });
+    }
+    Some(result)
 }
 
 /// Decide whether a sibling worktree's index directory is a usable seed source, returning its
@@ -867,15 +1072,19 @@ fn parse_files_parallel(
                         let units = extract_units(path, &source, lang);
                         match hash_file(&full_path) {
                             Ok(content_hash) => match get_mtime(&full_path) {
-                                Ok(mtime) => ParsedFileResult {
-                                    path: path.clone(),
-                                    units,
-                                    file_info: Some(FileInfo {
-                                        content_hash,
-                                        mtime,
-                                    }),
-                                    skip_reason: None,
-                                },
+                                Ok(mtime) => {
+                                    let unit_fingerprints = file_unit_fingerprints(&units);
+                                    ParsedFileResult {
+                                        path: path.clone(),
+                                        units,
+                                        file_info: Some(FileInfo {
+                                            content_hash,
+                                            mtime,
+                                            units: unit_fingerprints,
+                                        }),
+                                        skip_reason: None,
+                                    }
+                                }
                                 Err(e) => ParsedFileResult {
                                     path: path.clone(),
                                     units: Vec::new(),
@@ -1363,6 +1572,9 @@ impl IndexBuilder {
                         FileInfo {
                             content_hash: hash,
                             mtime,
+                            // No fingerprints: these files fall back to
+                            // whole-file re-embedding when they next change.
+                            units: Vec::new(),
                         },
                     );
                 }
@@ -2382,7 +2594,7 @@ impl IndexBuilder {
             .cloned()
             .collect();
 
-        let mut new_units: Vec<CodeUnit> = Vec::new();
+        let mut parsed_files: Vec<(PathBuf, Vec<CodeUnit>)> = Vec::new();
 
         // Progress bar for parsing (only if there are files to index)
         let pb = if !files_to_index.is_empty() {
@@ -2410,9 +2622,9 @@ impl IndexBuilder {
                 continue;
             }
 
-            new_units.extend(parsed.units);
             if let Some(file_info) = parsed.file_info {
-                state.files.insert(parsed.path, file_info);
+                state.files.insert(parsed.path.clone(), file_info);
+                parsed_files.push((parsed.path, parsed.units));
             }
         }
         let parsing_interrupted = is_interrupted();
@@ -2436,9 +2648,67 @@ impl IndexBuilder {
             .collect();
         let _ = delete_files_from_index(index_path, &stale_skipped);
 
-        // 3. Add new units to index
+        // 3. Decide, per changed file, what actually needs re-embedding. Files with
+        // stored unit fingerprints are diffed unit-by-unit: unchanged units keep
+        // their docs (position-only moves become in-place metadata patches), and
+        // only changed/added units pay for encoding. Changed files without usable
+        // fingerprints fall back to whole-file delete + re-embed. The doc-ID
+        // lookups must all complete before any delete, because deletes renumber the
+        // surviving documents — note the stale_skipped delete above already ran.
+        let changed_set: HashSet<&PathBuf> = plan.changed.iter().collect();
+        let mut to_embed: Vec<CodeUnit> = Vec::new();
+        let mut stale_doc_ids: Vec<i64> = Vec::new();
+        let mut whole_file_deletes: Vec<PathBuf> = Vec::new();
+        let mut patches: Vec<UnitMetadataPatch> = Vec::new();
+
+        for (path, units) in parsed_files {
+            if !changed_set.contains(&path) {
+                // Newly added file: everything gets embedded, nothing to delete.
+                to_embed.extend(units);
+                continue;
+            }
+
+            let file_display = path.to_string_lossy().to_string();
+            let diff = old_state
+                .files
+                .get(&path)
+                .filter(|info| !info.units.is_empty())
+                .and_then(|info| {
+                    let rows = load_indexed_unit_rows(index_path, &file_display)?;
+                    diff_file_units(&info.units, rows, &units, &file_display)
+                });
+
+            match diff {
+                Some(diff) => {
+                    to_embed.extend(diff.to_embed);
+                    stale_doc_ids.extend(diff.stale_doc_ids);
+                    patches.extend(diff.patches);
+                }
+                None => {
+                    whole_file_deletes.push(path);
+                    to_embed.extend(units);
+                }
+            }
+        }
+
+        // Unchanged units that moved: patch their metadata in place (the UPDATE
+        // re-syncs the FTS row). Must run before the batched delete below, which
+        // would renumber the doc IDs the patches refer to.
+        for patch in &patches {
+            filtering::update_where(
+                index_path,
+                "_subset_ = ?",
+                &[serde_json::json!(patch.doc_id)],
+                &patch.updates,
+            )?;
+        }
+
+        stale_doc_ids.extend(collect_doc_ids_for_files(index_path, &whole_file_deletes));
+
+        // 4. Replace stale docs and add new units
         let mut was_interrupted = false;
-        if !new_units.is_empty() {
+        if !to_embed.is_empty() {
+            let mut new_units = to_embed;
             // Build call graph for new units
             build_call_graph(&mut new_units);
 
@@ -2473,11 +2743,11 @@ impl IndexBuilder {
             // Compute effective pool factor based on batch size
             let pool_factor = self.resolve_pool_factor(new_units.len());
 
-            // Delete changed files from index right before writing new data.
-            // Deferred from earlier to minimize the window where data is missing
-            // from the index (for concurrent readers and interrupt safety). Batched
-            // into a single index rewrite — see delete_files_from_index / issue #116.
-            delete_files_from_index(index_path, &plan.changed)?;
+            // Delete stale docs right before writing new data. Deferred from
+            // earlier to minimize the window where data is missing from the index
+            // (for concurrent readers and interrupt safety). Batched into a single
+            // index rewrite — see delete_doc_ids_from_index / issue #116.
+            delete_doc_ids_from_index(index_path, &stale_doc_ids)?;
 
             let sorted_units = prepare_units_for_encoding(&new_units, index_chunk_size);
             let pipeline_interrupted = self.run_encoding_pipeline(
@@ -2490,6 +2760,10 @@ impl IndexBuilder {
             was_interrupted |= pipeline_interrupted;
 
             pb.finish_and_clear();
+        } else {
+            // Nothing needs encoding, but removed units still need deleting
+            // (e.g. a changed file whose only edit was deleting a function).
+            delete_doc_ids_from_index(index_path, &stale_doc_ids)?;
         }
 
         if was_interrupted || is_interrupted() {
@@ -4332,6 +4606,7 @@ mod tests {
             FileInfo {
                 content_hash: 0xDEAD_BEEF,
                 mtime: get_mtime(&file_path).unwrap(),
+                units: Vec::new(),
             },
         );
 
@@ -4388,6 +4663,7 @@ mod tests {
                 FileInfo {
                     content_hash,
                     mtime,
+                    units: Vec::new(),
                 },
             );
             mismatched_mtimes.files.insert(
@@ -4395,6 +4671,7 @@ mod tests {
                 FileInfo {
                     content_hash,
                     mtime: mtime + 1,
+                    units: Vec::new(),
                 },
             );
         }
@@ -4429,6 +4706,66 @@ mod tests {
             hashed_every_file.as_secs_f64() / stat_only.as_secs_f64().max(f64::EPSILON),
             removed,
         );
+    }
+
+    /// Measures what the per-unit diff saves on a single-function edit in a
+    /// large file: how many units must be re-encoded with and without stored
+    /// fingerprints, plus the wall-clock cost of the diff itself (the new
+    /// overhead paid per changed file). Encoding dominates real update time
+    /// (one ONNX forward pass per unit), so "units to re-encode" is the cost
+    /// driver; the diff runs in microseconds.
+    ///
+    ///   cargo test -p colgrep --release measure_unit_diff -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing measurement; run manually in release mode"]
+    fn measure_unit_diff_reembed_savings() {
+        const FUNCTIONS: usize = 500;
+
+        let file = "big_module.py";
+        let mut source = String::new();
+        for i in 0..FUNCTIONS {
+            source.push_str(&format!(
+                "def func_{i:03}():\n    return {i} + compute_{i}()\n\n"
+            ));
+        }
+
+        let rel = PathBuf::from(file);
+        let old_units = extract_units(&rel, &source, Language::Python);
+        let fingerprints = file_unit_fingerprints(&old_units);
+        let db_rows: Vec<IndexedUnitRow> = old_units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| IndexedUnitRow {
+                doc_id: i as i64,
+                key: unit_key(&u.qualified_name, file),
+                line: u.line as i64,
+                end_line: u.end_line as i64,
+            })
+            .collect();
+
+        // Edit one function in the middle of the file.
+        let edited = source.replace("return 250 + compute_250()", "return 9000 + compute_250()");
+        assert_ne!(source, edited);
+        let new_units = extract_units(&rel, &edited, Language::Python);
+
+        let started = std::time::Instant::now();
+        let diff = diff_file_units(&fingerprints, db_rows, &new_units, file).unwrap();
+        let diff_cost = started.elapsed();
+
+        println!(
+            "single-function edit in a {}-unit file:\n  \
+             units re-encoded without fingerprints (old behavior): {}\n  \
+             units re-encoded with fingerprints:                   {}\n  \
+             docs deleted: {}   metadata patches: {}\n  \
+             diff overhead paid per changed file: {:?}",
+            new_units.len(),
+            new_units.len(),
+            diff.to_embed.len(),
+            diff.stale_doc_ids.len(),
+            diff.patches.len(),
+            diff_cost,
+        );
+        assert_eq!(diff.to_embed.len(), 1, "exactly the edited unit re-encodes");
     }
 
     #[test]
@@ -5059,14 +5396,13 @@ mod tests {
         }
     }
 
-    /// Build a small vector index + filtering DB + FTS5 mirror at `index_path`, distributing
-    /// `n` documents evenly across `files`. Each doc carries its file and a globally unique
-    /// FTS-searchable term `uniqword<doc_id>`. Model-free.
-    fn build_fixture_index(index_path: &str, files: &[&str], docs_per_file: usize) {
+    /// Build a small vector index + filtering DB + FTS5 mirror at `index_path` with one
+    /// document per metadata row (doc IDs 0..n in row order). Model-free.
+    fn build_fixture_index_with_metadata(index_path: &str, metadata: &[serde_json::Value]) {
         use ndarray::Array2;
         use next_plaid::IndexConfig;
 
-        let n = files.len() * docs_per_file;
+        let n = metadata.len();
         let mut embeddings: Vec<Array2<f32>> = Vec::new();
         for i in 0..n {
             let mut doc = Array2::<f32>::zeros((5, 32));
@@ -5097,6 +5433,22 @@ mod tests {
         };
         MmapIndex::create_with_kmeans(&embeddings, index_path, &config).unwrap();
 
+        let doc_ids: Vec<i64> = (0..n as i64).collect();
+        filtering::create(index_path, metadata, &doc_ids).unwrap();
+        next_plaid::text_search::index(
+            index_path,
+            metadata,
+            &doc_ids,
+            &next_plaid::FtsTokenizer::IdentifierAware,
+        )
+        .unwrap();
+    }
+
+    /// Build a small vector index + filtering DB + FTS5 mirror at `index_path`, distributing
+    /// `n` documents evenly across `files`. Each doc carries its file and a globally unique
+    /// FTS-searchable term `uniqword<doc_id>`. Model-free.
+    fn build_fixture_index(index_path: &str, files: &[&str], docs_per_file: usize) {
+        let n = files.len() * docs_per_file;
         let metadata: Vec<serde_json::Value> = (0..n)
             .map(|i| {
                 serde_json::json!({
@@ -5105,15 +5457,7 @@ mod tests {
                 })
             })
             .collect();
-        let doc_ids: Vec<i64> = (0..n as i64).collect();
-        filtering::create(index_path, &metadata, &doc_ids).unwrap();
-        next_plaid::text_search::index(
-            index_path,
-            &metadata,
-            &doc_ids,
-            &next_plaid::FtsTokenizer::IdentifierAware,
-        )
-        .unwrap();
+        build_fixture_index_with_metadata(index_path, &metadata);
     }
 
     /// The number of `delete_from_index` calls recorded against one index path.
@@ -5269,6 +5613,234 @@ mod tests {
         assert_eq!(row[0]["file"], "d.rs");
     }
 
+    fn diff_test_unit(
+        file: &str,
+        name: &str,
+        code: &str,
+        line: usize,
+        end_line: usize,
+    ) -> CodeUnit {
+        let mut unit = CodeUnit::new(
+            name.to_string(),
+            file.into(),
+            line,
+            end_line,
+            crate::parser::Language::Python,
+            crate::parser::UnitType::Function,
+            None,
+        );
+        unit.signature = format!("def {name}()");
+        unit.code = code.to_string();
+        unit
+    }
+
+    fn db_row(doc_id: i64, key: &str, line: i64, end_line: i64) -> IndexedUnitRow {
+        IndexedUnitRow {
+            doc_id,
+            key: key.to_string(),
+            line,
+            end_line,
+        }
+    }
+
+    /// Pass 1 of the unit diff: unchanged content with shifted lines becomes a
+    /// metadata patch; changed content becomes a delete + re-embed.
+    #[test]
+    fn test_diff_file_units_patches_moves_and_replaces_changes() {
+        let file = "calc.py";
+        let old_f = diff_test_unit(file, "f", "def f():\n    return 1", 1, 2);
+        let old_g = diff_test_unit(file, "g", "def g():\n    return 2", 4, 5);
+        let old_units = file_unit_fingerprints(&[old_f, old_g]);
+        let db_rows = vec![db_row(0, "f", 1, 2), db_row(1, "g", 4, 5)];
+
+        // f edited in place; g shifted down two lines, content unchanged.
+        let new_f = diff_test_unit(file, "f", "def f():\n    return 10", 1, 2);
+        let new_g = diff_test_unit(file, "g", "def g():\n    return 2", 6, 7);
+
+        let diff = diff_file_units(&old_units, db_rows, &[new_f, new_g], file).unwrap();
+
+        assert_eq!(diff.stale_doc_ids, vec![0], "edited f must be replaced");
+        assert_eq!(diff.to_embed.len(), 1);
+        assert_eq!(diff.to_embed[0].name, "f");
+        assert_eq!(diff.patches.len(), 1, "moved g needs only a metadata patch");
+        assert_eq!(diff.patches[0].doc_id, 1);
+        assert_eq!(diff.patches[0].updates["line"], 6);
+        assert_eq!(diff.patches[0].updates["end_line"], 7);
+    }
+
+    #[test]
+    fn test_diff_file_units_handles_added_and_removed_units() {
+        let file = "calc.py";
+        let f = diff_test_unit(file, "f", "def f():\n    return 1", 1, 2);
+        let g = diff_test_unit(file, "g", "def g():\n    return 2", 4, 5);
+        let old_units = file_unit_fingerprints(&[f.clone(), g]);
+        let db_rows = vec![db_row(0, "f", 1, 2), db_row(1, "g", 4, 5)];
+
+        // g removed, h added; f untouched.
+        let h = diff_test_unit(file, "h", "def h():\n    return 3", 4, 5);
+        let diff = diff_file_units(&old_units, db_rows, &[f, h], file).unwrap();
+
+        assert_eq!(
+            diff.stale_doc_ids,
+            vec![1],
+            "removed g's doc must be deleted"
+        );
+        assert_eq!(diff.to_embed.len(), 1);
+        assert_eq!(diff.to_embed[0].name, "h");
+        assert!(diff.patches.is_empty(), "untouched f needs no patch");
+    }
+
+    /// RawCode gap units are keyed by their start line, so a pure shift renames
+    /// them. Pass 2 must recognize the identical content under the new key and
+    /// patch it in place instead of deleting and re-embedding.
+    #[test]
+    fn test_diff_file_units_moves_renamed_raw_code_blocks() {
+        let file = "script.py";
+        let mut old_raw = diff_test_unit(file, "raw_code_3", "x = 1", 3, 3);
+        old_raw.unit_type = crate::parser::UnitType::RawCode;
+        let old_units = file_unit_fingerprints(&[old_raw]);
+        let db_rows = vec![db_row(0, "raw_code_3", 3, 3)];
+
+        let mut new_raw = diff_test_unit(file, "raw_code_9", "x = 1", 9, 9);
+        new_raw.unit_type = crate::parser::UnitType::RawCode;
+
+        let diff = diff_file_units(&old_units, db_rows, &[new_raw], file).unwrap();
+
+        assert!(diff.stale_doc_ids.is_empty());
+        assert!(diff.to_embed.is_empty());
+        assert_eq!(diff.patches.len(), 1);
+        assert_eq!(
+            diff.patches[0].updates["qualified_name"],
+            "script.py::raw_code_9"
+        );
+        assert_eq!(diff.patches[0].updates["name"], "raw_code_9");
+        assert_eq!(diff.patches[0].updates["line"], 9);
+    }
+
+    /// Stored fingerprints that don't line up 1:1 with the file's metadata-DB
+    /// rows can't be trusted (e.g. an interrupted earlier run) → `None`, which
+    /// sends the caller down the whole-file re-embed fallback.
+    #[test]
+    fn test_diff_file_units_rejects_mismatched_db_rows() {
+        let file = "calc.py";
+        let f = diff_test_unit(file, "f", "def f():\n    return 1", 1, 2);
+        let old_units = file_unit_fingerprints(std::slice::from_ref(&f));
+
+        assert!(diff_file_units(&old_units, vec![], std::slice::from_ref(&f), file).is_none());
+        let extra_row = vec![db_row(0, "f", 1, 2), db_row(1, "f", 3, 4)];
+        assert!(diff_file_units(&old_units, extra_row, std::slice::from_ref(&f), file).is_none());
+        let wrong_key = vec![db_row(0, "other", 1, 2)];
+        assert!(diff_file_units(&old_units, wrong_key, std::slice::from_ref(&f), file).is_none());
+    }
+
+    /// Sets up a real (model-free) index for `calc.py` containing functions f and
+    /// g, plus an IndexState carrying their unit fingerprints. The stored mtime is
+    /// zeroed so a subsequent rewrite of the file is detected through the content
+    /// hash regardless of filesystem timestamp resolution.
+    fn setup_unit_diff_project(
+        proj: &Path,
+        idx: &Path,
+    ) -> (PathBuf, PathBuf, Vec<CodeUnit>, IndexState) {
+        let rel = PathBuf::from("calc.py");
+        let full = proj.join(&rel);
+        let original = "def f():\n    return 1\n\n\ndef g():\n    return 2\n";
+        std::fs::write(&full, original).unwrap();
+
+        let units = extract_units(&rel, original, Language::Python);
+        assert_eq!(units.len(), 2, "fixture expects exactly f and g");
+
+        let vector = get_vector_index_path(idx);
+        std::fs::create_dir_all(&vector).unwrap();
+        let metadata: Vec<serde_json::Value> = units
+            .iter()
+            .map(|u| serde_json::to_value(u).unwrap())
+            .collect();
+        build_fixture_index_with_metadata(vector.to_str().unwrap(), &metadata);
+
+        let mut state = IndexState::default();
+        state.files.insert(
+            rel.clone(),
+            FileInfo {
+                content_hash: hash_file(&full).unwrap(),
+                mtime: 0,
+                units: file_unit_fingerprints(&units),
+            },
+        );
+
+        (rel, vector, units, state)
+    }
+
+    /// End-to-end, model-free: deleting one function from a file removes only that
+    /// unit's doc. The surviving unit's fingerprint is unchanged, so nothing needs
+    /// the embedding model — the test builder's model path is nonexistent on
+    /// purpose, proving no re-embedding happened.
+    #[test]
+    fn test_incremental_update_deletes_only_removed_units() {
+        let proj = tempfile::tempdir().unwrap();
+        let idx = tempfile::tempdir().unwrap();
+        let (rel, vector, _units, state) = setup_unit_diff_project(proj.path(), idx.path());
+
+        std::fs::write(proj.path().join(&rel), "def f():\n    return 1\n").unwrap();
+
+        let mut builder = test_builder(proj.path(), idx.path());
+        let stats = builder.incremental_update(&state, None).unwrap();
+
+        assert_eq!(stats.changed, 1);
+        let index_path = vector.to_str().unwrap();
+        assert_eq!(filtering::count(index_path).unwrap(), 1);
+        let names = filtering::get_distinct_strings(index_path, "qualified_name").unwrap();
+        assert_eq!(names, vec!["calc.py::f".to_string()]);
+        assert_eq!(
+            MmapIndex::load(index_path).unwrap().metadata.num_documents,
+            1
+        );
+
+        let saved = IndexState::load(idx.path()).unwrap();
+        assert_eq!(
+            saved.files.get(&rel).unwrap().units.len(),
+            1,
+            "saved fingerprints must reflect the new parse"
+        );
+    }
+
+    /// End-to-end, model-free: inserting blank lines shifts a unit without
+    /// changing its content. Its doc must be patched in place (fresh line numbers
+    /// in the metadata DB) with no deletes and no re-embedding.
+    #[test]
+    fn test_incremental_update_patches_shifted_units_in_place() {
+        let proj = tempfile::tempdir().unwrap();
+        let idx = tempfile::tempdir().unwrap();
+        let (rel, vector, _units, state) = setup_unit_diff_project(proj.path(), idx.path());
+
+        let shifted = "def f():\n    return 1\n\n\n\n\ndef g():\n    return 2\n";
+        std::fs::write(proj.path().join(&rel), shifted).unwrap();
+        let new_g_line = extract_units(&rel, shifted, Language::Python)
+            .iter()
+            .find(|u| u.name == "g")
+            .unwrap()
+            .line;
+
+        let mut builder = test_builder(proj.path(), idx.path());
+        let stats = builder.incremental_update(&state, None).unwrap();
+
+        assert_eq!(stats.changed, 1);
+        let index_path = vector.to_str().unwrap();
+        assert_eq!(filtering::count(index_path).unwrap(), 2, "no docs deleted");
+        let rows = filtering::get(
+            index_path,
+            Some("qualified_name = ?"),
+            &[serde_json::json!("calc.py::g")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["line"], serde_json::json!(new_g_line));
+        assert_eq!(
+            MmapIndex::load(index_path).unwrap().metadata.num_documents,
+            2
+        );
+    }
+
     /// Issue #115 (bug 1): an index left dirty by an interrupted run must be cleaned once the
     /// repair has reconciled it, even when there are no file changes. Otherwise the dirty flag
     /// is never cleared and every future run pays for a needless repair — "permanently dirty".
@@ -5319,6 +5891,7 @@ mod tests {
             FileInfo {
                 content_hash: 1,
                 mtime: 1,
+                units: Vec::new(),
             },
         );
         state.save(src_dir).unwrap(); // save() stamps the current format version

@@ -35,10 +35,21 @@ pub struct IndexState {
     pub dirty: bool,
 }
 
+/// One indexed code unit's identity within its file: the unit key (qualified
+/// name with the `<file>::` prefix stripped, so renames don't invalidate it)
+/// and the fingerprint of its embedding-relevant content.
+pub type UnitFingerprint = (String, u64);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub content_hash: u64,
     pub mtime: u64,
+    /// Unit-level fingerprints from the last successful indexing of this file,
+    /// in source-line order. Lets a changed file re-embed only the units whose
+    /// content actually changed. Empty for states written before fingerprints
+    /// existed — those files fall back to whole-file re-embedding once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<UnitFingerprint>,
 }
 
 impl IndexState {
@@ -127,6 +138,7 @@ mod tests {
         let info = FileInfo {
             content_hash: 12345678901234567890,
             mtime: 1700000000,
+            units: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -146,6 +158,7 @@ mod tests {
             FileInfo {
                 content_hash: 123456,
                 mtime: 1700000000,
+                units: Vec::new(),
             },
         );
         let state = IndexState {
@@ -168,6 +181,25 @@ mod tests {
             .contains_key(&PathBuf::from("src/main.rs")));
     }
 
+    /// FileInfo entries written before unit fingerprints existed must load with
+    /// an empty fingerprint list (selecting the whole-file re-embed fallback),
+    /// and populated lists must round-trip.
+    #[test]
+    fn test_file_info_unit_fingerprints_roundtrip_and_legacy() {
+        let legacy = r#"{"content_hash":1,"mtime":2}"#;
+        let info: FileInfo = serde_json::from_str(legacy).unwrap();
+        assert!(info.units.is_empty());
+
+        let info = FileInfo {
+            content_hash: 1,
+            mtime: 2,
+            units: vec![("f".to_string(), 42), ("Class::method".to_string(), 7)],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: FileInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.units, info.units);
+    }
+
     #[test]
     fn test_index_state_load_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
@@ -187,6 +219,7 @@ mod tests {
             FileInfo {
                 content_hash: 999999,
                 mtime: 1700000000,
+                units: Vec::new(),
             },
         );
 
@@ -354,6 +387,7 @@ mod tests {
             FileInfo {
                 content_hash: 1,
                 mtime: 1700000000,
+                units: Vec::new(),
             },
         );
         init.save(&index_dir).unwrap();
@@ -380,6 +414,7 @@ mod tests {
                             FileInfo {
                                 content_hash: (t * iterations + i) as u64,
                                 mtime: 1700000000,
+                                units: Vec::new(),
                             },
                         );
                         state.save(&dir).unwrap();
