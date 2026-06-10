@@ -356,6 +356,90 @@ fn load_indexed_unit_rows(index_path: &str, file_display: &str) -> Option<Vec<In
     Some(result)
 }
 
+/// Pair deleted paths with added paths whose content hash matches: the same
+/// bytes at a new location are a rename, handled as an in-place metadata update
+/// instead of a delete + re-embed of identical content.
+///
+/// Matching is exact-content only and 1:1 (first candidate in plan order wins);
+/// a rename that also edits the file is not detected and takes the normal
+/// delete + add path. Detected languages must match because the parser keys off
+/// the extension — foo.js → foo.ts must re-parse even with identical bytes.
+fn detect_renames(plan: &mut UpdatePlan, state: &IndexState, added_hashes: &HashMap<PathBuf, u64>) {
+    if plan.deleted.is_empty() || plan.added.is_empty() {
+        return;
+    }
+
+    let mut added_by_hash: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    for path in &plan.added {
+        if let Some(&hash) = added_hashes.get(path) {
+            added_by_hash.entry(hash).or_default().push(path.clone());
+        }
+    }
+
+    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut still_deleted: Vec<PathBuf> = Vec::new();
+    for old_path in plan.deleted.drain(..) {
+        let matched = state.files.get(&old_path).and_then(|info| {
+            let candidates = added_by_hash.get_mut(&info.content_hash)?;
+            let position = candidates
+                .iter()
+                .position(|new_path| detect_language(new_path) == detect_language(&old_path))?;
+            Some(candidates.remove(position))
+        });
+        match matched {
+            Some(new_path) => renamed.push((old_path, new_path)),
+            None => still_deleted.push(old_path),
+        }
+    }
+
+    plan.deleted = still_deleted;
+    let renamed_targets: HashSet<&PathBuf> = renamed.iter().map(|(_, new)| new).collect();
+    plan.added.retain(|path| !renamed_targets.contains(path));
+    plan.renamed = renamed;
+}
+
+/// Repoint every metadata row of `old_path` at `new_path` in place: the `file`
+/// column and the path prefix of `qualified_name` are rewritten via SQL UPDATEs
+/// (`filtering::update_where` re-syncs the FTS rows automatically). The stored
+/// vectors are untouched: the only path-derived embedding content is the
+/// normalized `File:` line, so a rename leaves at most a few stale path tokens
+/// in the vector until the unit next changes — a deliberate trade against
+/// re-encoding byte-identical content.
+fn rename_file_in_index(index_path: &str, old_path: &Path, new_path: &Path) -> Result<usize> {
+    let old_str = old_path.to_string_lossy().to_string();
+    let new_str = new_path.to_string_lossy().to_string();
+    let rows = filtering::get(
+        index_path,
+        Some("file = ?"),
+        &[serde_json::json!(old_str)],
+        None,
+    )?;
+
+    let old_prefix = format!("{}::", old_str);
+    for row in &rows {
+        let Some(doc_id) = row.get("_subset_").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let new_qualified = row
+            .get("qualified_name")
+            .and_then(|v| v.as_str())
+            .and_then(|qualified| qualified.strip_prefix(&old_prefix))
+            .map(|rest| format!("{}::{}", new_str, rest));
+
+        let updates = match new_qualified {
+            Some(qualified) => serde_json::json!({ "file": new_str, "qualified_name": qualified }),
+            None => serde_json::json!({ "file": new_str }),
+        };
+        filtering::update_where(
+            index_path,
+            "_subset_ = ?",
+            &[serde_json::json!(doc_id)],
+            &updates,
+        )?;
+    }
+    Ok(rows.len())
+}
+
 /// Decide whether a sibling worktree's index directory is a usable seed source, returning its
 /// loaded [`IndexState`] when so (and `None` otherwise).
 ///
@@ -434,6 +518,7 @@ pub struct UpdateStats {
     pub added: usize,
     pub changed: usize,
     pub deleted: usize,
+    pub renamed: usize,
     pub unchanged: usize,
     pub skipped: usize,
 }
@@ -443,6 +528,9 @@ pub struct UpdatePlan {
     pub added: Vec<PathBuf>,
     pub changed: Vec<PathBuf>,
     pub deleted: Vec<PathBuf>,
+    /// (old path, new path) pairs with byte-identical content: applied as
+    /// in-place metadata updates instead of delete + re-embed.
+    pub renamed: Vec<(PathBuf, PathBuf)>,
     pub unchanged: usize,
 }
 
@@ -1831,6 +1919,7 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: 0,
                 unchanged: 0,
                 skipped: 0,
             });
@@ -1920,6 +2009,7 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: 0,
                 unchanged,
                 skipped: 0,
             });
@@ -1959,6 +2049,7 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: 0,
                 unchanged,
                 skipped: 0,
             });
@@ -2020,6 +2111,7 @@ impl IndexBuilder {
             added: files_added.len(),
             changed: files_changed.len(),
             deleted: 0,
+            renamed: 0,
             unchanged,
             skipped: 0,
         })
@@ -2341,6 +2433,7 @@ impl IndexBuilder {
             added,
             changed: 0,
             deleted: stale.len(),
+            renamed: 0,
             unchanged: already,
             skipped,
         })
@@ -2497,6 +2590,7 @@ impl IndexBuilder {
             added: files.len(),
             changed: 0,
             deleted: 0,
+            renamed: 0,
             unchanged: 0,
             skipped,
         })
@@ -2520,7 +2614,25 @@ impl IndexBuilder {
             }
         }
 
-        // 0. Clean up orphaned entries (files in index but not on disk).
+        let mut state = old_state.clone();
+
+        // 0. Apply renames first: byte-identical content at a new path needs only
+        // in-place metadata updates, never re-embedding. This must precede the
+        // orphan cleanup below, which would otherwise see the old paths' docs as
+        // orphans (the old path is gone from disk) and delete them.
+        for (old_path, new_path) in &plan.renamed {
+            rename_file_in_index(index_path, old_path, new_path)?;
+            if let Some(mut info) = state.files.remove(old_path) {
+                if let Ok(mtime) = get_mtime(&self.project_root.join(new_path)) {
+                    info.mtime = mtime;
+                }
+                // content_hash and unit fingerprints are path-independent and
+                // still valid for the new path.
+                state.files.insert(new_path.clone(), info);
+            }
+        }
+
+        // 1. Clean up orphaned entries (files in index but not on disk).
         // This handles directory deletion/rename and any inconsistencies, but it
         // queries every distinct file in the metadata DB and stats each one — too
         // expensive to run on every search. Deletions in the plan already cover the
@@ -2533,18 +2645,18 @@ impl IndexBuilder {
             0
         };
 
-        // Nothing to do
+        // Nothing (more) to do
         if plan.added.is_empty()
             && plan.changed.is_empty()
             && plan.deleted.is_empty()
             && orphaned_deleted == 0
         {
-            // If the previous run left the index dirty, the repair above already brought the
-            // store back in sync — so clear the flag now. Returning without persisting would
-            // leave the index permanently dirty, forcing a (costly) repair on every future
-            // run even though nothing is wrong. See issue #115.
-            if old_state.dirty {
-                let mut state = old_state.clone();
+            // Persist the re-keyed state after renames. And if the previous run
+            // left the index dirty, the repair above already brought the store
+            // back in sync — so clear the flag now. Returning without persisting
+            // would leave the index permanently dirty, forcing a (costly) repair
+            // on every future run even though nothing is wrong. See issue #115.
+            if old_state.dirty || !plan.renamed.is_empty() {
                 state.dirty = false;
                 state.save(&self.index_dir)?;
             }
@@ -2552,19 +2664,18 @@ impl IndexBuilder {
                 added: 0,
                 changed: 0,
                 deleted: 0,
+                renamed: plan.renamed.len(),
                 unchanged: plan.unchanged,
                 skipped: 0,
             });
         }
-
-        let mut state = old_state.clone();
 
         if !plan.deleted.is_empty() || !plan.changed.is_empty() || !plan.added.is_empty() {
             state.dirty = true;
             state.save(&self.index_dir)?;
         }
 
-        // 1. Delete chunks for deleted files (safe — not re-adding these). Batched into a
+        // 2. Delete chunks for deleted files (safe — not re-adding these). Batched into a
         //    single index rewrite — see delete_files_from_index / issue #116.
         delete_files_from_index(index_path, &plan.deleted)?;
 
@@ -2585,7 +2696,7 @@ impl IndexBuilder {
             state.files.remove(&path);
         }
 
-        // 2. Index new/changed files (skip previously ignored files)
+        // 3. Index new/changed files (skip previously ignored files)
         let files_to_index: Vec<PathBuf> = plan
             .added
             .iter()
@@ -2648,7 +2759,7 @@ impl IndexBuilder {
             .collect();
         let _ = delete_files_from_index(index_path, &stale_skipped);
 
-        // 3. Decide, per changed file, what actually needs re-embedding. Files with
+        // 4. Decide, per changed file, what actually needs re-embedding. Files with
         // stored unit fingerprints are diffed unit-by-unit: unchanged units keep
         // their docs (position-only moves become in-place metadata patches), and
         // only changed/added units pay for encoding. Changed files without usable
@@ -2705,7 +2816,7 @@ impl IndexBuilder {
 
         stale_doc_ids.extend(collect_doc_ids_for_files(index_path, &whole_file_deletes));
 
-        // 4. Replace stale docs and add new units
+        // 5. Replace stale docs and add new units
         let mut was_interrupted = false;
         if !to_embed.is_empty() {
             let mut new_units = to_embed;
@@ -2779,6 +2890,7 @@ impl IndexBuilder {
             added: plan.added.len(),
             changed: plan.changed.len(),
             deleted: plan.deleted.len(),
+            renamed: plan.renamed.len(),
             unchanged: plan.unchanged,
             skipped: 0,
         })
@@ -3063,6 +3175,7 @@ impl IndexBuilder {
         let current_set: HashSet<_> = current_files.iter().cloned().collect();
 
         let mut plan = UpdatePlan::default();
+        let mut added_hashes: HashMap<PathBuf, u64> = HashMap::new();
 
         for path in &current_files {
             // Skip files that previously failed to parse (e.g. invalid UTF-8)
@@ -3094,7 +3207,10 @@ impl IndexBuilder {
             match state.files.get(path) {
                 Some(info) if info.content_hash == hash => plan.unchanged += 1,
                 Some(_) => plan.changed.push(path.clone()),
-                None => plan.added.push(path.clone()),
+                None => {
+                    added_hashes.insert(path.clone(), hash);
+                    plan.added.push(path.clone());
+                }
             }
         }
 
@@ -3103,6 +3219,10 @@ impl IndexBuilder {
                 plan.deleted.push(path.clone());
             }
         }
+
+        // The added-file hashes were just computed and the deleted files' old
+        // hashes are in `state`, so rename detection costs no extra I/O.
+        detect_renames(&mut plan, state, &added_hashes);
 
         Ok(plan)
     }
@@ -5838,6 +5958,111 @@ mod tests {
         assert_eq!(
             MmapIndex::load(index_path).unwrap().metadata.num_documents,
             2
+        );
+    }
+
+    /// A deleted path and an added path with the same content hash and the same
+    /// detected language must be planned as a rename, not a delete + add.
+    #[test]
+    fn test_update_plan_detects_renames() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = "def f():\n    return 1\n";
+        std::fs::write(temp.path().join("renamed.py"), content).unwrap();
+
+        let builder = test_builder(temp.path(), &temp.path().join("index"));
+
+        let mut state = IndexState::default();
+        state.files.insert(
+            PathBuf::from("original.py"),
+            FileInfo {
+                content_hash: xxhash_rust::xxh3::xxh3_64(content.as_bytes()),
+                mtime: 0,
+                units: Vec::new(),
+            },
+        );
+
+        let plan = builder.compute_update_plan(&state, None).unwrap();
+        assert_eq!(
+            plan.renamed,
+            vec![(PathBuf::from("original.py"), PathBuf::from("renamed.py"))]
+        );
+        assert!(plan.added.is_empty(), "renamed file must leave `added`");
+        assert!(plan.deleted.is_empty(), "renamed file must leave `deleted`");
+    }
+
+    /// Identical bytes under a different extension are NOT a rename: the parser
+    /// keys off the extension, so the file must be re-parsed and re-embedded.
+    #[test]
+    fn test_update_plan_rename_requires_same_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = "# same bytes\n";
+        std::fs::write(temp.path().join("config.rb"), content).unwrap();
+
+        let builder = test_builder(temp.path(), &temp.path().join("index"));
+
+        let mut state = IndexState::default();
+        state.files.insert(
+            PathBuf::from("config.py"),
+            FileInfo {
+                content_hash: xxhash_rust::xxh3::xxh3_64(content.as_bytes()),
+                mtime: 0,
+                units: Vec::new(),
+            },
+        );
+
+        let plan = builder.compute_update_plan(&state, None).unwrap();
+        assert!(plan.renamed.is_empty());
+        assert_eq!(plan.added, vec![PathBuf::from("config.rb")]);
+        assert_eq!(plan.deleted, vec![PathBuf::from("config.py")]);
+    }
+
+    /// End-to-end, model-free: renaming a file on disk repoints its metadata rows
+    /// (file + qualified_name) in place and re-keys the state entry — no docs are
+    /// deleted, nothing is re-embedded, and the stored unit fingerprints survive
+    /// under the new path.
+    #[test]
+    fn test_incremental_update_applies_renames_in_place() {
+        let proj = tempfile::tempdir().unwrap();
+        let idx = tempfile::tempdir().unwrap();
+        let (rel, vector, _units, state) = setup_unit_diff_project(proj.path(), idx.path());
+
+        std::fs::rename(proj.path().join(&rel), proj.path().join("util.py")).unwrap();
+
+        let mut builder = test_builder(proj.path(), idx.path());
+        let stats = builder.incremental_update(&state, None).unwrap();
+
+        assert_eq!(stats.renamed, 1);
+        assert_eq!(stats.added, 0);
+        assert_eq!(stats.changed, 0);
+        assert_eq!(stats.deleted, 0);
+
+        let index_path = vector.to_str().unwrap();
+        assert_eq!(filtering::count(index_path).unwrap(), 2, "no docs deleted");
+        let files = filtering::get_distinct_strings(index_path, "file").unwrap();
+        assert_eq!(files, vec!["util.py".to_string()]);
+        let mut names = filtering::get_distinct_strings(index_path, "qualified_name").unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["util.py::f".to_string(), "util.py::g".to_string()]
+        );
+        assert_eq!(
+            MmapIndex::load(index_path).unwrap().metadata.num_documents,
+            2,
+            "vectors must be untouched"
+        );
+
+        // FTS rows were re-synced by the UPDATE: the new path is searchable.
+        let hits = next_plaid::text_search::search(index_path, "util", 10).unwrap();
+        assert_eq!(hits.passage_ids.len(), 2);
+
+        let saved = IndexState::load(idx.path()).unwrap();
+        assert!(!saved.files.contains_key(&rel));
+        let new_info = saved.files.get(&PathBuf::from("util.py")).unwrap();
+        assert_eq!(
+            new_info.units.len(),
+            2,
+            "unit fingerprints must survive the re-key"
         );
     }
 
