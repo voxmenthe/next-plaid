@@ -56,20 +56,26 @@ const BUILDING_MARKER: &str = ".building";
 /// more often (more resumable) at the cost of more index-append overhead.
 const BUILD_CHECKPOINT_UNITS: usize = 4096;
 
-/// Test-only counter of expensive `delete_from_index` invocations.
+/// Test-only per-index counter of expensive `delete_from_index` invocations.
 ///
 /// Issue #116: deleting many files used to call the full-index-rewrite primitive once per
 /// file, making an incremental update O(changed_files × index_size). Batching collapses that
-/// to a single call; this counter lets regression tests assert the batching holds.
+/// to a single call; this counter lets regression tests assert the batching holds. Keyed by
+/// index path so concurrently running tests (each in its own tempdir) can't pollute each
+/// other's counts.
 #[cfg(test)]
-static DELETE_FROM_INDEX_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static DELETE_FROM_INDEX_CALLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Wrapper over [`next_plaid::delete_from_index`] that counts calls under `cfg(test)`.
 /// Zero overhead in release builds.
 fn delete_from_index_counted(ids: &[i64], index_path: &str) -> Result<usize> {
     #[cfg(test)]
-    DELETE_FROM_INDEX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut calls = DELETE_FROM_INDEX_CALLS.lock().unwrap();
+        *calls.entry(index_path.to_string()).or_insert(0) += 1;
+    }
     Ok(delete_from_index(ids, index_path)?)
 }
 
@@ -86,12 +92,14 @@ fn delete_from_index_counted(ids: &[i64], index_path: &str) -> Result<usize> {
 /// surviving documents, so interleaving reads and deletes would invalidate the IDs that haven't
 /// been deleted yet. Returns the number of documents removed.
 fn delete_files_from_index(index_path: &str, files: &[PathBuf]) -> Result<usize> {
-    if files.is_empty() {
-        return Ok(0);
-    }
+    let ids = collect_doc_ids_for_files(index_path, files);
+    delete_doc_ids_from_index(index_path, &ids)
+}
 
-    // Gather the doc IDs for every file first (dedup in case a path appears twice), then
-    // delete the whole set in one pass.
+/// Look up the doc IDs of every entry belonging to any of `files` (deduplicated, in
+/// query order). Read-only: callers must complete all ID lookups before any deletion,
+/// because deletes renumber the surviving documents.
+fn collect_doc_ids_for_files(index_path: &str, files: &[PathBuf]) -> Vec<i64> {
     let mut ids: Vec<i64> = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
     for file_path in files {
@@ -105,14 +113,42 @@ fn delete_files_from_index(index_path: &str, files: &[PathBuf]) -> Result<usize>
             }
         }
     }
+    ids
+}
 
+/// Delete a set of doc IDs from all three storage layers in one pass: the vector index,
+/// the SQLite metadata table, and the FTS5 mirror. Returns the number of documents removed.
+///
+/// The FTS5 step is required for correctness, not hygiene. FTS5 rowids mirror the
+/// `_subset_` IDs, and `filtering::delete` re-sequences every surviving ID — so after any
+/// delete that isn't exactly the tail of the ID space, every survivor's FTS row points at
+/// a *different* (renumbered) metadata row. Worse, later re-adds reuse the now-smaller ID
+/// range, and external-content FTS5 accepts duplicate-rowid inserts without error, leaving
+/// stale postings that silently corrupt hybrid ranking. Suffix deletes keep every
+/// survivor's ID, so only the deleted rows need removing — O(deleted); any other delete
+/// must rebuild the FTS index against the new numbering.
+fn delete_doc_ids_from_index(index_path: &str, ids: &[i64]) -> Result<usize> {
     if ids.is_empty() {
         return Ok(0);
     }
 
-    delete_from_index_counted(&ids, index_path)?;
-    filtering::delete(index_path, &ids)?;
-    Ok(ids.len())
+    let mut sorted_ids = ids.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+
+    // The suffix check must use the pre-delete document count.
+    let total_docs = filtering::count(index_path)? as i64;
+    let suffix_start = total_docs - sorted_ids.len() as i64;
+    let is_suffix_delete = sorted_ids.first().is_some_and(|&min| min >= suffix_start);
+
+    delete_from_index_counted(&sorted_ids, index_path)?;
+    filtering::delete(index_path, &sorted_ids)?;
+    if is_suffix_delete {
+        next_plaid::text_search::delete(index_path, &sorted_ids)?;
+    } else {
+        next_plaid::text_search::rebuild(index_path)?;
+    }
+    Ok(sorted_ids.len())
 }
 
 /// Decide whether a sibling worktree's index directory is a usable seed source, returning its
@@ -5023,8 +5059,9 @@ mod tests {
         }
     }
 
-    /// Build a small vector index + filtering DB at `index_path`, distributing `n` documents
-    /// evenly across `files` (each doc tagged with its file in the filtering DB). Model-free.
+    /// Build a small vector index + filtering DB + FTS5 mirror at `index_path`, distributing
+    /// `n` documents evenly across `files`. Each doc carries its file and a globally unique
+    /// FTS-searchable term `uniqword<doc_id>`. Model-free.
     fn build_fixture_index(index_path: &str, files: &[&str], docs_per_file: usize) {
         use ndarray::Array2;
         use next_plaid::IndexConfig;
@@ -5061,10 +5098,32 @@ mod tests {
         MmapIndex::create_with_kmeans(&embeddings, index_path, &config).unwrap();
 
         let metadata: Vec<serde_json::Value> = (0..n)
-            .map(|i| serde_json::json!({ "file": files[i / docs_per_file] }))
+            .map(|i| {
+                serde_json::json!({
+                    "file": files[i / docs_per_file],
+                    "code": format!("uniqword{}", i),
+                })
+            })
             .collect();
         let doc_ids: Vec<i64> = (0..n as i64).collect();
         filtering::create(index_path, &metadata, &doc_ids).unwrap();
+        next_plaid::text_search::index(
+            index_path,
+            &metadata,
+            &doc_ids,
+            &next_plaid::FtsTokenizer::IdentifierAware,
+        )
+        .unwrap();
+    }
+
+    /// The number of `delete_from_index` calls recorded against one index path.
+    fn delete_calls_for(index_path: &str) -> usize {
+        DELETE_FROM_INDEX_CALLS
+            .lock()
+            .unwrap()
+            .get(index_path)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Issue #116: deleting many files must collapse into a *single* full-index rewrite, not one
@@ -5072,8 +5131,6 @@ mod tests {
     /// for minutes). Asserts both the call count and that exactly the right documents survive.
     #[test]
     fn test_delete_files_from_index_is_a_single_rewrite() {
-        use std::sync::atomic::Ordering;
-
         let tmp = tempfile::tempdir().unwrap();
         let index_path = tmp.path().to_str().unwrap();
 
@@ -5084,9 +5141,9 @@ mod tests {
         // Delete three of the four files in one batched call.
         let to_delete: Vec<PathBuf> = ["a.rs", "b.rs", "c.rs"].iter().map(PathBuf::from).collect();
 
-        let before = DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed);
+        let before = delete_calls_for(index_path);
         let removed = delete_files_from_index(index_path, &to_delete).unwrap();
-        let calls = DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed) - before;
+        let calls = delete_calls_for(index_path) - before;
 
         assert_eq!(removed, 9, "should remove 3 files × 3 docs");
         assert_eq!(
@@ -5104,19 +5161,112 @@ mod tests {
     /// Deleting nothing (or only unknown files) must not rewrite the index at all.
     #[test]
     fn test_delete_files_from_index_noop_does_not_rewrite() {
-        use std::sync::atomic::Ordering;
-
         let tmp = tempfile::tempdir().unwrap();
         let index_path = tmp.path().to_str().unwrap();
         build_fixture_index(index_path, &["a.rs"], 2);
 
-        let before = DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed);
+        let before = delete_calls_for(index_path);
         assert_eq!(delete_files_from_index(index_path, &[]).unwrap(), 0);
         assert_eq!(
             delete_files_from_index(index_path, &[PathBuf::from("missing.rs")]).unwrap(),
             0
         );
-        assert_eq!(DELETE_FROM_INDEX_CALLS.load(Ordering::Relaxed) - before, 0);
+        assert_eq!(delete_calls_for(index_path) - before, 0);
+    }
+
+    /// The FTS5 mirror must stay aligned with the renumbered `_subset_` IDs after
+    /// colgrep deletes files (mirror of next-plaid's `test_delete_keeps_fts_aligned`).
+    /// `filtering::delete` re-sequences every surviving ID, so without FTS maintenance
+    /// a non-suffix delete leaves every survivor's FTS row pointing at a different
+    /// (renumbered) metadata row — silently, since SQLite reports no error.
+    #[test]
+    fn test_delete_files_keeps_fts_aligned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().to_str().unwrap();
+
+        // a.rs → docs 0,1; b.rs → docs 2,3; c.rs → docs 4,5
+        build_fixture_index(index_path, &["a.rs", "b.rs", "c.rs"], 2);
+
+        // Non-suffix delete: a.rs holds the *lowest* IDs, so all four survivors
+        // renumber (2,3,4,5 → 0,1,2,3) and the FTS index must be rebuilt.
+        delete_files_from_index(index_path, &[PathBuf::from("a.rs")]).unwrap();
+
+        // c.rs's first doc was id 4 and is now id 2; its FTS hit must land on the
+        // metadata row that actually holds that text.
+        let hits = next_plaid::text_search::search(index_path, "uniqword4", 10).unwrap();
+        assert_eq!(
+            hits.passage_ids,
+            vec![2],
+            "FTS hit must follow the renumbering"
+        );
+        let row = filtering::get(index_path, None, &[], Some(&[2])).unwrap();
+        assert_eq!(row[0]["code"], "uniqword4");
+        assert_eq!(row[0]["file"], "c.rs");
+
+        // The deleted file's terms must be gone entirely.
+        let gone = next_plaid::text_search::search(index_path, "uniqword0", 10).unwrap();
+        assert!(
+            gone.passage_ids.is_empty(),
+            "deleted docs must leave the FTS index"
+        );
+
+        // Suffix delete: c.rs now holds the tail IDs (2,3); survivors keep their IDs.
+        delete_files_from_index(index_path, &[PathBuf::from("c.rs")]).unwrap();
+        let hits = next_plaid::text_search::search(index_path, "uniqword2", 10).unwrap();
+        assert_eq!(hits.passage_ids, vec![0]);
+        let gone = next_plaid::text_search::search(index_path, "uniqword4", 10).unwrap();
+        assert!(gone.passage_ids.is_empty());
+    }
+
+    /// Re-adding documents after a non-suffix delete must not collide with stale FTS
+    /// rows. External-content FTS5 accepts duplicate-rowid inserts without error, so
+    /// before the delete path maintained the FTS mirror, a term from a *deleted*
+    /// document could still match at a rowid that now belongs to fresh content.
+    #[test]
+    fn test_readd_after_delete_does_not_leave_stale_fts_postings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().to_str().unwrap();
+
+        // a.rs → docs 0,1; b.rs → docs 2,3
+        build_fixture_index(index_path, &["a.rs", "b.rs"], 2);
+
+        // Non-suffix delete shrinks the ID space to 0,1 (b.rs renumbered).
+        delete_files_from_index(index_path, &[PathBuf::from("a.rs")]).unwrap();
+
+        // Re-add two docs for a new file at IDs 2,3 — the IDs the old b.rs rows
+        // occupied before the delete.
+        let metadata = vec![
+            serde_json::json!({ "file": "d.rs", "code": "freshword2" }),
+            serde_json::json!({ "file": "d.rs", "code": "freshword3" }),
+        ];
+        filtering::update(index_path, &metadata, &[2, 3]).unwrap();
+        next_plaid::text_search::index(
+            index_path,
+            &metadata,
+            &[2, 3],
+            &next_plaid::FtsTokenizer::IdentifierAware,
+        )
+        .unwrap();
+
+        // Pre-fix, the FTS index still held rowids 0..3 from before the delete, so the
+        // re-add at rowids 2,3 created duplicate FTS rows: a.rs's terms still matched
+        // (at rowids now owned by other content) and b.rs's old postings shadowed the
+        // fresh ones. Post-fix, every term resolves to exactly its current row.
+        let stale = next_plaid::text_search::search(index_path, "uniqword0", 10).unwrap();
+        assert!(
+            stale.passage_ids.is_empty(),
+            "terms of the deleted file must not match any rowid after the re-add"
+        );
+        let moved = next_plaid::text_search::search(index_path, "uniqword3", 10).unwrap();
+        assert_eq!(
+            moved.passage_ids,
+            vec![1],
+            "surviving b.rs term must resolve to its renumbered row, not its old rowid"
+        );
+        let fresh = next_plaid::text_search::search(index_path, "freshword2", 10).unwrap();
+        assert_eq!(fresh.passage_ids, vec![2]);
+        let row = filtering::get(index_path, None, &[], Some(&[2])).unwrap();
+        assert_eq!(row[0]["file"], "d.rs");
     }
 
     /// Issue #115 (bug 1): an index left dirty by an interrupted run must be cleaned once the
