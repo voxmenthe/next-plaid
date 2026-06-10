@@ -171,12 +171,13 @@ pub fn build_embedding_text(unit: &CodeUnit) -> String {
     }
 
     // === Layer 2: Call Graph ===
+    // Only outgoing calls: they derive from the unit's own body, so the text is a
+    // pure function of file content. `called_by` is intentionally excluded — it is
+    // computed per indexing batch (incremental runs only see changed files' units),
+    // so the same unchanged function would embed differently depending on which
+    // files happened to change alongside it. It remains in the metadata DB.
     if !unit.calls.is_empty() {
         parts.push(format!("Calls: {}", unit.calls.join(", ")));
-    }
-
-    if !unit.called_by.is_empty() {
-        parts.push(format!("Called by: {}", unit.called_by.join(", ")));
     }
 
     // === Layer 4: Data Flow ===
@@ -334,6 +335,34 @@ mod tests {
         let file_idx = text.find("File: ").unwrap();
         let code_idx = text.find("Code:\n").unwrap();
         assert!(file_idx < code_idx);
+    }
+
+    /// The embedding text must be a pure function of the unit's own file content.
+    /// `called_by` is populated by build_call_graph over whatever batch of units
+    /// happens to be indexed together, so baking it into the text made the same
+    /// function embed differently across incremental runs.
+    #[test]
+    fn test_embedding_text_ignores_batch_local_called_by() {
+        let mut unit = CodeUnit::new(
+            "compute".to_string(),
+            "src/math.rs".into(),
+            1,
+            5,
+            crate::parser::Language::Rust,
+            UnitType::Function,
+            None,
+        );
+        unit.signature = "fn compute() -> i32".to_string();
+        unit.code = "fn compute() -> i32 { helper() }".to_string();
+        unit.calls = vec!["helper".to_string()];
+
+        let without_callers = build_embedding_text(&unit);
+        unit.called_by = vec!["caller_a".to_string(), "caller_b".to_string()];
+        let with_callers = build_embedding_text(&unit);
+
+        assert_eq!(without_callers, with_callers);
+        assert!(!with_callers.contains("Called by"));
+        assert!(with_callers.contains("Calls: helper"));
     }
 
     #[test]
